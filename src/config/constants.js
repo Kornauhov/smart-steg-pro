@@ -1,2 +1,2 @@
-export const DEBUG = true;
+export const DEBUG = false;
 export const APP_ID = "stege-lager-v1";
