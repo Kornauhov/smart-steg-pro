@@ -287,7 +287,7 @@ export default function App() {
     for (const it of masterItems) {
       const awb = it?.awb ? String(it.awb) : null;
       if (!awb) continue;
-      for (const steg of [it?.steg1, it?.steg2]) {
+      for (const steg of [it?.steg1, it?.steg2, it?.steg3, it?.steg4]) {
         if (!steg) continue;
         const key = String(steg).toUpperCase();
         if (!m.has(key)) m.set(key, new Set());
