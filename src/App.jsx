@@ -1000,28 +1000,35 @@ export default function App() {
 
               <QRScanner enabled={scannerEnabled} onResult={applyScan} onError={(e) => console.error(e)} />
 
-              <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-2">
-                <div className="text-[10px] font-black uppercase text-slate-400">Fallback</div>
-                <div className="flex gap-2">
-                  <input
-                    value={qrTextFallback}
-                    onChange={(e) => setQrTextFallback(e.target.value)}
-                    placeholder="z.B. C1 oder C2 oder C2-L1"
-                    className="flex-1 p-3 bg-white rounded-xl font-bold border-2 border-slate-100 outline-none"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => applyScan(qrTextFallback)}
-                    className="px-4 py-3 bg-slate-900 text-yellow-500 rounded-xl font-black"
-                    disabled={scanLocked || confirmOpen || moving}
-                  >
-                    Anwenden
-                  </button>
-                </div>
-                <div className="text-[10px] text-slate-500 font-bold">
-                  Quelle: oberste belegte Ebene • Ziel: unterste freie Ebene
-                </div>
-              </div>
+<div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-3">
+  <div className="text-[10px] font-black uppercase text-slate-400">Fallback</div>
+
+  <input
+    value={qrTextFallback}
+    onChange={(e) => setQrTextFallback(e.target.value)}
+    placeholder="z.B. C1 oder C2 oder C2-L1"
+    className="w-full p-3 bg-white rounded-xl font-bold border-2 border-slate-100 outline-none"
+  />
+
+  <div className="flex justify-center">
+    <button
+      type="button"
+      onClick={() => applyScan(qrTextFallback)}
+      disabled={scanLocked || confirmOpen || moving}
+      className={`px-8 py-3 rounded-xl font-black active:scale-95 transition-all ${
+        scanLocked || confirmOpen || moving
+          ? "bg-slate-300 text-white cursor-not-allowed"
+          : "bg-slate-900 text-yellow-500"
+      }`}
+    >
+      Anwenden
+    </button>
+  </div>
+
+  <div className="text-[10px] text-slate-500 font-bold text-center">
+    Quelle: oberste belegte Ebene • Ziel: unterste freie Ebene
+  </div>
+</div>
 
               {confirmOpen && qrSource.shelf && qrTarget.shelf && (
                 <div className="bg-white border-2 border-blue-200 rounded-[1.5rem] p-5 shadow-sm">
