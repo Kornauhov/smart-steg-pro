@@ -28,14 +28,14 @@ import NavBtn from "./components/NavBtn.jsx";
 ========================= */
 function parsePlace(text) {
   const raw = String(text || "").trim().toUpperCase();
-  // erlaubt: C1   oder   C1-L5   oder   C1 L5
+  // erlaubt: C1 | C1-L5 | C1 L5
   const m = raw.match(/^C(\d{1,2})(?:\s*[-_ ]?\s*L(\d))?$/);
   if (!m) return null;
   return { shelf: `C${Number(m[1])}`, level: m[2] ? Number(m[2]) : null };
 }
 
 function findTopOccupiedLevel(slotMap, shelf, levels) {
-  // levels ist z.B. [5,4,3,2,1] -> "oberste belegte Ebene"
+  // levels: [5,4,3,2,1] => oberste belegte Ebene
   for (const lvl of levels) {
     const entries = slotMap.get(`${shelf}|${lvl}`) || [];
     if (entries.length) return lvl;
@@ -44,7 +44,7 @@ function findTopOccupiedLevel(slotMap, shelf, levels) {
 }
 
 function findBottomEmptyLevel(slotMap, shelf, levels) {
-  // "unterste freie Ebene" => bottom-up: 1,2,3,4,5
+  // unterste freie Ebene: bottom-up 1..5
   const bottomUp = [...levels].sort((a, b) => a - b);
   for (const lvl of bottomUp) {
     const entries = slotMap.get(`${shelf}|${lvl}`) || [];
@@ -54,32 +54,87 @@ function findBottomEmptyLevel(slotMap, shelf, levels) {
 }
 
 /* =========================
-   QRScanner (iOS-safe)
-   - Start NUR per Button (User Gesture)
+   QRScanner (iOS/Android safe)
+   - Start NUR per Button (User-Gesture)
+   - bevorzugt Back/Rear/Environment Kamera
+   - Toggle Kamera (Front/Back) möglich
    - Stoppt automatisch wenn enabled=false
 ========================= */
 function QRScanner({ enabled, onResult, onError }) {
   const regionId = "qr-reader-region";
   const qrRef = useRef(null);
+
   const [running, setRunning] = useState(false);
   const [lastText, setLastText] = useState("");
+  const [cams, setCams] = useState([]);
+  const [selectedCamId, setSelectedCamId] = useState(null);
+  const [camMode, setCamMode] = useState("auto"); // auto | back | front
+
+  const choosePreferred = (list, mode = "auto") => {
+    if (!list?.length) return null;
+
+    const byLabel = (re) => list.find((c) => re.test(String(c.label || "")));
+    const backRe = /back|rear|environment|rück|hinten|main/i;
+    const frontRe = /front|user|selfie|vorn|face/i;
+
+    if (mode === "back") {
+      return byLabel(backRe) || list[list.length - 1] || list[0];
+    }
+    if (mode === "front") {
+      return byLabel(frontRe) || list[0];
+    }
+    // auto
+    return byLabel(backRe) || list[list.length - 1] || list[0];
+  };
+
+  const refreshCameras = async () => {
+    const list = await Html5Qrcode.getCameras();
+    setCams(list || []);
+    const preferred = choosePreferred(list || [], camMode);
+    if (preferred?.id) setSelectedCamId(preferred.id);
+    return list || [];
+  };
+
+  const stop = async () => {
+    try {
+      if (!qrRef.current) return;
+      await qrRef.current.stop().catch(() => {});
+      await qrRef.current.clear().catch(() => {});
+    } finally {
+      setRunning(false);
+    }
+  };
 
   const start = async () => {
     try {
       if (!enabled || running) return;
 
-      const cameras = await Html5Qrcode.getCameras();
-      if (!cameras || cameras.length === 0) {
+      // Kameras laden (iOS: erst nach Permission sind Labels oft gefüllt)
+      const list = await refreshCameras();
+      if (!list.length) {
         alert("❗ Keine Kamera gefunden.");
         return;
       }
 
       if (!qrRef.current) qrRef.current = new Html5Qrcode(regionId);
+
+      // Cam auswählen
+      let camId = selectedCamId;
+      if (!camId) {
+        const preferred = choosePreferred(list, camMode);
+        camId = preferred?.id;
+        setSelectedCamId(camId || null);
+      }
+
+      if (!camId) {
+        alert("❗ Kamera konnte nicht ausgewählt werden.");
+        return;
+      }
+
       setRunning(true);
 
-      // iOS: häufig ist cameras[0] ok, alternativ kannst du später gezielt "back" auswählen
       await qrRef.current.start(
-        { deviceId: { exact: cameras[0].id } },
+        { deviceId: { exact: camId } },
         { fps: 10, qrbox: { width: 260, height: 260 } },
         (decodedText) => {
           if (!decodedText) return;
@@ -97,22 +152,30 @@ function QRScanner({ enabled, onResult, onError }) {
     }
   };
 
-  const stop = async () => {
-    try {
-      if (!qrRef.current) return;
-      await qrRef.current.stop().catch(() => {});
-      await qrRef.current.clear().catch(() => {});
-    } finally {
-      setRunning(false);
+  const toggleCamera = async () => {
+    // Wechseln: auto -> back -> front -> back ...
+    const nextMode = camMode === "auto" ? "back" : camMode === "back" ? "front" : "back";
+    setCamMode(nextMode);
+
+    // Wenn läuft: stoppen, Cam auswählen, wieder starten
+    const list = cams.length ? cams : await refreshCameras();
+    const preferred = choosePreferred(list, nextMode);
+    if (preferred?.id) setSelectedCamId(preferred.id);
+
+    if (running) {
+      await stop();
+      // kurzer Tick, dann start
+      setTimeout(() => start(), 150);
     }
   };
 
+  // stop on disable
   useEffect(() => {
-    // wenn enabled=false => sofort stoppen
     if (!enabled && running) stop();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [enabled]);
 
+  // cleanup
   useEffect(() => {
     return () => {
       stop();
@@ -121,34 +184,49 @@ function QRScanner({ enabled, onResult, onError }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const camLabel =
+    camMode === "auto" ? "Auto (Back bevorzugt)" : camMode === "back" ? "Back" : "Front";
+
   return (
     <div className="bg-slate-900 rounded-2xl overflow-hidden border border-slate-700">
       <div id={regionId} className="w-full" style={{ minHeight: 320 }} />
 
       <div className="p-3 flex items-center justify-between gap-2">
         <div className="text-[11px] font-bold text-slate-300">
-          {!enabled ? "Scanner pausiert" : running ? "Scanner aktiv" : "Scanner bereit"}
+          {!enabled ? "Scanner pausiert" : running ? "Scanner aktiv" : "Scanner bereit"} • Kamera:{" "}
+          <span className="text-yellow-400">{camLabel}</span>
         </div>
 
-        {enabled && !running ? (
+        <div className="flex items-center gap-2">
           <button
             type="button"
-            onClick={start}
-            className="px-4 py-2 bg-yellow-500 text-slate-900 rounded-xl font-black text-[11px] active:scale-95"
+            onClick={toggleCamera}
+            className="px-3 py-2 bg-slate-700 text-white rounded-xl font-black text-[11px] active:scale-95"
+            title="Kamera wechseln"
           >
-            Scanner starten
+            Wechseln
           </button>
-        ) : null}
 
-        {enabled && running ? (
-          <button
-            type="button"
-            onClick={stop}
-            className="px-4 py-2 bg-slate-700 text-white rounded-xl font-black text-[11px] active:scale-95"
-          >
-            Stop
-          </button>
-        ) : null}
+          {enabled && !running ? (
+            <button
+              type="button"
+              onClick={start}
+              className="px-4 py-2 bg-yellow-500 text-slate-900 rounded-xl font-black text-[11px] active:scale-95"
+            >
+              Scanner starten
+            </button>
+          ) : null}
+
+          {enabled && running ? (
+            <button
+              type="button"
+              onClick={stop}
+              className="px-4 py-2 bg-slate-700 text-white rounded-xl font-black text-[11px] active:scale-95"
+            >
+              Stop
+            </button>
+          ) : null}
+        </div>
       </div>
     </div>
   );
@@ -159,15 +237,14 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [user, setUser] = useState(null);
 
-  // QR MOVE STATES (SLOT ONLY)
+  // QR MOVE STATES (slot only)
   const [qrMode, setQrMode] = useState("source"); // source | target
   const [qrSource, setQrSource] = useState({ shelf: null, level: null });
   const [qrTarget, setQrTarget] = useState({ shelf: null, level: null });
-
   const [qrTextFallback, setQrTextFallback] = useState("");
   const [lastScan, setLastScan] = useState({ value: "", at: 0 });
 
-  // "sauber": nach Zielscan sperren + confirm UI anzeigen
+  // “sauber”: lock + confirm UI
   const [scanLocked, setScanLocked] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [moving, setMoving] = useState(false);
@@ -193,10 +270,7 @@ export default function App() {
     destination: "produktion",
   });
 
-  const shelves = useMemo(
-    () => Array.from({ length: 38 }, (_, i) => `C${i + 1}`),
-    []
-  );
+  const shelves = useMemo(() => Array.from({ length: 38 }, (_, i) => `C${i + 1}`), []);
   const levels = [5, 4, 3, 2, 1];
 
   /* =========================
@@ -223,7 +297,17 @@ export default function App() {
 
   useEffect(() => {
     if (window.lucide) window.lucide.createIcons();
-  }, [activeTab, rawItems.length, stegItems.length, masterItems.length, searchQuery, qrMode, scanLocked, confirmOpen]);
+  }, [
+    activeTab,
+    rawItems.length,
+    stegItems.length,
+    masterItems.length,
+    searchQuery,
+    qrMode,
+    scanLocked,
+    confirmOpen,
+    moving,
+  ]);
 
   /* =========================
      Firestore subscriptions
@@ -289,10 +373,7 @@ export default function App() {
 
       const shelf = d.shelf ?? d.location?.shelf ?? derived.shelf;
       const level = Number(d.level ?? d.location?.level ?? derived.level);
-      const slotId =
-        d.slotId ??
-        derived.slotId ??
-        (shelf && level ? slotIdFrom(shelf, level) : null);
+      const slotId = d.slotId ?? derived.slotId ?? (shelf && level ? slotIdFrom(shelf, level) : null);
 
       const itemKey = d.itemKey ?? d.key ?? d.code ?? d.__id;
       const quantity = Number(d.quantity) || 0;
@@ -334,10 +415,7 @@ export default function App() {
   }, [itemDocs]);
 
   const occupiedSlots = slotMap.size;
-  const totalParts = useMemo(
-    () => itemDocs.reduce((s, x) => s + (Number(x.quantity) || 0), 0),
-    [itemDocs]
-  );
+  const totalParts = useMemo(() => itemDocs.reduce((s, x) => s + (Number(x.quantity) || 0), 0), [itemDocs]);
 
   /* =========================
      AWB index (für Bestandssuche)
@@ -362,6 +440,9 @@ export default function App() {
     return s ? Array.from(s) : [];
   };
 
+  /* =========================
+     grouped + filtered slots
+  ========================= */
   const groupedSlots = useMemo(() => {
     const rows = Array.from(slotMap.entries()).map(([key, entries]) => {
       const [shelf, levelStr] = key.split("|");
@@ -385,9 +466,7 @@ export default function App() {
         const shelfMatch = String(slot.shelf).toUpperCase().includes(term);
         const matched = slot.entries.filter((e) => {
           const keyMatch = String(e.itemKey).toUpperCase().includes(term);
-          const awbMatch = getLinkedAWBs(e.itemKey).some((a) =>
-            String(a).toUpperCase().includes(term)
-          );
+          const awbMatch = getLinkedAWBs(e.itemKey).some((a) => String(a).toUpperCase().includes(term));
           const lvlMatch = `L${slot.level}`.includes(term);
           return keyMatch || awbMatch || shelfMatch || lvlMatch;
         });
@@ -415,11 +494,7 @@ export default function App() {
     const iRef = itemDocRef(slotId, itemKey);
 
     try {
-      await setDoc(
-        sRef,
-        { appId: APP_ID, slotId, shelf, level, updatedAt: Date.now() },
-        { merge: true }
-      );
+      await setDoc(sRef, { appId: APP_ID, slotId, shelf, level, updatedAt: Date.now() }, { merge: true });
 
       const snap = await getDoc(iRef);
       if (snap.exists()) {
@@ -492,12 +567,7 @@ export default function App() {
     try {
       const newQty = selected.quantity - qty;
       if (newQty <= 0) await deleteDoc(iRef);
-      else
-        await updateDoc(iRef, {
-          quantity: newQty,
-          updatedAt: Date.now(),
-          lastDestination: outStock.destination,
-        });
+      else await updateDoc(iRef, { quantity: newQty, updatedAt: Date.now(), lastDestination: outStock.destination });
 
       setOutStock({ entryId: "", qty: "", destination: "produktion" });
       setActiveTab("inventory");
@@ -508,7 +578,7 @@ export default function App() {
 
   /* =========================
      QR MOVE (slot only) - SAUBER
-  ========================= */
+========================= */
   const hardResetMove = () => {
     setQrMode("source");
     setQrSource({ shelf: null, level: null });
@@ -521,7 +591,6 @@ export default function App() {
   };
 
   const applyScan = (raw) => {
-    // wenn confirm offen/locked: nichts mehr scannen
     if (scanLocked || confirmOpen || moving) return;
 
     const now = Date.now();
@@ -548,7 +617,6 @@ export default function App() {
       return;
     }
 
-    // target
     const lvl = parsed.level ?? findBottomEmptyLevel(slotMap, parsed.shelf, levels);
     if (!lvl) {
       alert(`❗ ${parsed.shelf} ist voll.`);
@@ -556,10 +624,13 @@ export default function App() {
     }
 
     setQrTarget({ shelf: parsed.shelf, level: lvl });
-
-    // JETZT: sofort sperren + confirm UI öffnen
     setScanLocked(true);
     setConfirmOpen(true);
+
+    // optional: haptics
+    try {
+      if (navigator.vibrate) navigator.vibrate(30);
+    } catch {}
   };
 
   const handleMoveConfirm = async () => {
@@ -585,12 +656,11 @@ export default function App() {
     } catch (e) {
       console.error(e);
       alert(`❗ Fehler: ${e?.message || "Konsole prüfen"}`);
-      setMoving(false); // bleibt im confirm screen
+      setMoving(false);
     }
   };
 
   const handleMoveCancel = () => {
-    // Ziel weg, zurück in target-scan
     setConfirmOpen(false);
     setScanLocked(false);
     setQrTarget({ shelf: null, level: null });
@@ -598,8 +668,8 @@ export default function App() {
   };
 
   /* =========================
-     Loading screen
-  ========================= */
+     Loading
+========================= */
   if (loading)
     return (
       <div className="h-screen flex flex-col items-center justify-center bg-slate-900 text-yellow-500">
@@ -608,15 +678,10 @@ export default function App() {
       </div>
     );
 
-  // Scanner soll aktiv sein, solange:
-  // - wir in move tab sind
-  // - nicht confirmOpen
-  // - nicht scanLocked/moving
   const scannerEnabled = activeTab === "move" && !confirmOpen && !scanLocked && !moving;
 
   return (
     <div className="max-w-4xl mx-auto min-h-screen pb-36 relative">
-      {/* DEBUG overlay */}
       {DEBUG && (
         <div className="fixed top-3 right-3 z-[999] bg-white/90 backdrop-blur border border-slate-200 shadow-lg rounded-2xl px-4 py-3 text-[11px] font-bold text-slate-700">
           <div>
@@ -640,9 +705,7 @@ export default function App() {
             <h1 className="text-2xl font-black italic tracking-tighter uppercase leading-none">
               Smart Steg <span className="text-yellow-500">PRO</span>
             </h1>
-            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mt-1">
-              Lagerverwaltung Kran-Gestell
-            </p>
+            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mt-1">Lagerverwaltung Kran-Gestell</p>
           </div>
           <div className="bg-slate-800 p-3 rounded-2xl text-yellow-500 shadow-inner">
             <Icon name="factory" size={24} />
@@ -693,16 +756,12 @@ export default function App() {
                               setSearchQuery(`${s}`);
                               setActiveTab("inventory");
                             }}
-                            className={`w-7 h-7 rounded-lg grid-cell shadow-inner flex items-center justify-center ${
-                              count
-                                ? "bg-yellow-500 shadow-yellow-500/20 cursor-pointer"
-                                : "bg-slate-800 opacity-20 cursor-default"
+                            className={`w-7 h-7 rounded-lg shadow-inner flex items-center justify-center ${
+                              count ? "bg-yellow-500 shadow-yellow-500/20 cursor-pointer" : "bg-slate-800 opacity-20 cursor-default"
                             }`}
                             title={`${s} - L${l}`}
                           >
-                            {count ? (
-                              <span className="text-[11px] font-black text-slate-900">{count}</span>
-                            ) : null}
+                            {count ? <span className="text-[11px] font-black text-slate-900">{count}</span> : null}
                           </div>
                         );
                       })}
@@ -765,17 +824,12 @@ export default function App() {
                 </div>
               ) : (
                 filteredSlots.map((slot) => (
-                  <div
-                    key={`${slot.shelf}|${slot.level}`}
-                    className="bg-white p-5 rounded-[2rem] shadow-sm border border-slate-200"
-                  >
+                  <div key={`${slot.shelf}|${slot.level}`} className="bg-white p-5 rounded-[2rem] shadow-sm border border-slate-200">
                     <div className="flex items-center justify-between mb-3">
                       <span className="text-[15px] font-black bg-slate-900 text-yellow-500 px-3 py-1 rounded-full">
                         {slot.shelf} - L{slot.level}
                       </span>
-                      <span className="text-[11px] font-black text-slate-500 uppercase">
-                        {slot.entries.length} Stege
-                      </span>
+                      <span className="text-[11px] font-black text-slate-500 uppercase">{slot.entries.length} Stege</span>
                     </div>
 
                     <div className="space-y-2">
@@ -874,6 +928,7 @@ export default function App() {
                     ))}
                   </select>
                 </div>
+
                 <div className="space-y-1">
                   <label className="text-[10px] font-black uppercase text-slate-400 ml-4">Ebene</label>
                   <select
@@ -943,14 +998,8 @@ export default function App() {
                 />
               </div>
 
-              {/* Scanner: NUR aktiv solange wir noch nicht bestätigt haben */}
-              <QRScanner
-                enabled={scannerEnabled}
-                onResult={applyScan}
-                onError={(e) => console.error(e)}
-              />
+              <QRScanner enabled={scannerEnabled} onResult={applyScan} onError={(e) => console.error(e)} />
 
-              {/* Fallback */}
               <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-2">
                 <div className="text-[10px] font-black uppercase text-slate-400">Fallback</div>
                 <div className="flex gap-2">
@@ -974,7 +1023,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* CONFIRM UI (ersetzt window.confirm) */}
               {confirmOpen && qrSource.shelf && qrTarget.shelf && (
                 <div className="bg-white border-2 border-blue-200 rounded-[1.5rem] p-5 shadow-sm">
                   <div className="flex items-center justify-between">
@@ -1015,7 +1063,6 @@ export default function App() {
                 </div>
               )}
 
-              {/* Controls */}
               <div className="flex gap-2">
                 <button
                   type="button"
