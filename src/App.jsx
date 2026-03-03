@@ -41,12 +41,11 @@ function parsePlace(text) {
 }
 
 /**
- * 30-digit barcode example:
- * 030000024438160000011600004316
- * -> StegNr  = digits[7..13)  => 244381
- * -> Länge   = digits[13..17) => 6000
- * -> Menge   = digits[19..23) => 1160
- * -> Extra   = digits[26..30) => 4316 (optional)
+ * Beispiel: 030000024438160000011600004316
+ * - StegNr  = digits[7..13)  => 244381
+ * - Länge   = digits[13..17) => 6000
+ * - Menge   = digits[19..23) => 1160
+ * - Extra   = digits[26..30) => 4316 (optional)
  */
 function parseInboundBarcode(raw) {
   const digits = String(raw || "").replace(/\D/g, "");
@@ -83,9 +82,13 @@ function findBottomEmptyLevel(slotMap, shelf, levelsTopDown) {
 
 /* =========================
    QRScanner (html5-qrcode)
-   - App can start/stop via ref
+   - AutoStart wenn enabled
+   - steuerbar via ref.start / ref.stop
 ========================= */
-const QRScanner = forwardRef(function QRScanner({ enabled, onResult, onError }, ref) {
+const QRScanner = forwardRef(function QRScanner(
+  { enabled, autoStart = false, onResult, onError },
+  ref
+) {
   const regionIdRef = useRef(`qr-reader-${Math.random().toString(16).slice(2)}`);
   const qrRef = useRef(null);
 
@@ -139,8 +142,8 @@ const QRScanner = forwardRef(function QRScanner({ enabled, onResult, onError }, 
         setRunning(false);
         return;
       }
-
-      const preferred = cams.find((c) => /back|rear|environment/i.test(c.label)) || cams[0];
+      const preferred =
+        cams.find((c) => /back|rear|environment/i.test(c.label)) || cams[0];
 
       await qrRef.current.start(
         { deviceId: { exact: preferred.id } },
@@ -158,24 +161,25 @@ const QRScanner = forwardRef(function QRScanner({ enabled, onResult, onError }, 
       console.error("QR start error:", e);
       setRunning(false);
       onError?.(e);
-      alert("❗ Kamera konnte nicht gestartet werden. (HTTPS + Kamera-Berechtigung prüfen)");
+      alert(
+        "❗ Kamera konnte nicht gestartet werden. (HTTPS + Kamera-Berechtigung prüfen)"
+      );
     }
   };
 
-  useImperativeHandle(
-    ref,
-    () => ({
-      start,
-      stop,
-      isRunning: () => running,
-    }),
-    [running]
-  );
+  useImperativeHandle(ref, () => ({ start, stop, isRunning: () => running }), [
+    running,
+  ]);
 
+  // ✅ AutoStart wenn enabled
   useEffect(() => {
-    if (!enabled && running) stop();
+    if (!enabled) {
+      if (running) stop();
+      return;
+    }
+    if (autoStart && !running) start();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [enabled]);
+  }, [enabled, autoStart]);
 
   useEffect(() => {
     return () => {
@@ -191,18 +195,8 @@ const QRScanner = forwardRef(function QRScanner({ enabled, onResult, onError }, 
 
       <div className="p-3 flex items-center justify-between gap-2">
         <div className="text-[11px] font-bold text-slate-300">
-          {!enabled ? "Scanner pausiert" : running ? "Scanner aktiv" : "Scanner bereit"}
+          {!enabled ? "Scanner pausiert" : running ? "Scanner aktiv" : "Scanner startet…"}
         </div>
-
-        {enabled && !running ? (
-          <button
-            type="button"
-            onClick={start}
-            className="px-4 py-2 bg-yellow-500 text-slate-900 rounded-xl font-black text-[11px] active:scale-95"
-          >
-            Scanner starten
-          </button>
-        ) : null}
 
         {enabled && running ? (
           <button
@@ -218,6 +212,9 @@ const QRScanner = forwardRef(function QRScanner({ enabled, onResult, onError }, 
   );
 });
 
+/* =========================
+   App
+========================= */
 export default function App() {
   const [activeTab, setActiveTab] = useState("dashboard");
   const [loading, setLoading] = useState(true);
@@ -229,14 +226,17 @@ export default function App() {
   const [masterItems, setMasterItems] = useState([]);
   const [searchQuery, setSearchQuery] = useState("");
 
-  const shelves = useMemo(() => Array.from({ length: 38 }, (_, i) => `C${i + 1}`), []);
+  const shelves = useMemo(
+    () => Array.from({ length: 38 }, (_, i) => `C${i + 1}`),
+    []
+  );
   const levels = [5, 4, 3, 2, 1];
 
   /* =========================
-     EINLAGERN: Platz -> Barcode
-     - stop after place scan
-     - auto switch to barcode mode
-     - ignore window to avoid re-scan of QR
+     EINLAGERN (AutoStart + AutoSwitch)
+     - Tab Eingang startet automatisch
+     - Platz-Scan -> stop -> step=barcode -> ignore -> start
+     - Barcode-Scan -> stop (damit nicht doppelt scannt)
 ========================= */
   const inboundScannerRef = useRef(null);
 
@@ -261,9 +261,35 @@ export default function App() {
 
   const [manualStegQuery, setManualStegQuery] = useState("");
 
+  const resetInboundToPlace = async () => {
+    await inboundScannerRef.current?.stop?.();
+    setInStep("place");
+    inStepRef.current = "place";
+    setInPlace(null);
+    setBarcodeRaw("");
+    setInbound((x) => ({ ...x, itemKey: "", lengthMm: "", qty: "", extra: "" }));
+    inboundIgnoreUntilRef.current = Date.now() + 700;
+    setTimeout(() => inboundScannerRef.current?.start?.(), 250);
+  };
+
+  const resetInboundToBarcode = async () => {
+    if (!inPlace?.shelf) {
+      alert("Bitte zuerst Platz scannen.");
+      return;
+    }
+    await inboundScannerRef.current?.stop?.();
+    setInStep("barcode");
+    inStepRef.current = "barcode";
+    setBarcodeRaw("");
+    setInbound((x) => ({ ...x, itemKey: "", lengthMm: "", qty: "", extra: "" }));
+    inboundIgnoreUntilRef.current = Date.now() + 700;
+    setTimeout(() => inboundScannerRef.current?.start?.(), 250);
+  };
+
   const resetInboundAll = async () => {
     await inboundScannerRef.current?.stop?.();
     setInStep("place");
+    inStepRef.current = "place";
     setInPlace(null);
     setBarcodeRaw("");
     setManualStegQuery("");
@@ -274,8 +300,8 @@ export default function App() {
       deliveryDate: new Date().toISOString().slice(0, 10),
       extra: "",
     });
-    // small ignore to avoid instant re-scan when user still points at code
     inboundIgnoreUntilRef.current = Date.now() + 500;
+    setTimeout(() => inboundScannerRef.current?.start?.(), 250);
   };
 
   const onScanPlaceForInbound = async (decodedText) => {
@@ -287,18 +313,16 @@ export default function App() {
 
     setInPlace(p);
 
-    // ✅ ref immediately (no waiting for setState)
-    inStepRef.current = "barcode";
+    // ✅ sofort barcode mode (ref sofort!)
     setInStep("barcode");
+    inStepRef.current = "barcode";
 
-    // ✅ ignore next frames (avoid scanning the same QR again)
+    // ✅ ignore next frames (avoid scanning same QR again)
     inboundIgnoreUntilRef.current = Date.now() + 900;
 
-    // ✅ stop -> restart
+    // ✅ stop and restart scanner -> clean switch
     await inboundScannerRef.current?.stop?.();
-    setTimeout(() => {
-      inboundScannerRef.current?.start?.();
-    }, 350);
+    setTimeout(() => inboundScannerRef.current?.start?.(), 250);
 
     try {
       navigator.vibrate?.(30);
@@ -324,7 +348,7 @@ export default function App() {
       extra: p.extra,
     }));
 
-    // ✅ stop after barcode scan
+    // ✅ stop after barcode scan to prevent double scans
     await inboundScannerRef.current?.stop?.();
     inboundIgnoreUntilRef.current = Date.now() + 600;
 
@@ -342,7 +366,11 @@ export default function App() {
     };
   }, [inPlace, inbound]);
 
-  const canPutaway = !reqMissing.place && !reqMissing.itemKey && !reqMissing.qty && !reqMissing.lengthMm;
+  const canPutaway =
+    !reqMissing.place &&
+    !reqMissing.itemKey &&
+    !reqMissing.qty &&
+    !reqMissing.lengthMm;
 
   /* =========================
      Auth init
@@ -434,7 +462,8 @@ export default function App() {
 
       const shelf = d.shelf ?? d.location?.shelf ?? derived.shelf;
       const level = Number(d.level ?? d.location?.level ?? derived.level);
-      const slotId = d.slotId ?? derived.slotId ?? (shelf && level ? slotIdFrom(shelf, level) : null);
+      const slotId =
+        d.slotId ?? derived.slotId ?? (shelf && level ? slotIdFrom(shelf, level) : null);
 
       const itemKey = d.itemKey ?? d.key ?? d.code ?? d.__id;
       const quantity = Number(d.quantity) || 0;
@@ -476,7 +505,10 @@ export default function App() {
   }, [itemDocs]);
 
   const occupiedSlots = slotMap.size;
-  const totalParts = useMemo(() => itemDocs.reduce((s, x) => s + (Number(x.quantity) || 0), 0), [itemDocs]);
+  const totalParts = useMemo(
+    () => itemDocs.reduce((s, x) => s + (Number(x.quantity) || 0), 0),
+    [itemDocs]
+  );
 
   /* =========================
      AWB index
@@ -527,7 +559,9 @@ export default function App() {
         const shelfMatch = String(slot.shelf).toUpperCase().includes(term);
         const matched = slot.entries.filter((e) => {
           const keyMatch = String(e.itemKey).toUpperCase().includes(term);
-          const awbMatch = getLinkedAWBs(e.itemKey).some((a) => String(a).toUpperCase().includes(term));
+          const awbMatch = getLinkedAWBs(e.itemKey).some((a) =>
+            String(a).toUpperCase().includes(term)
+          );
           const lvlMatch = `L${slot.level}`.includes(term);
           return keyMatch || awbMatch || shelfMatch || lvlMatch;
         });
@@ -540,7 +574,7 @@ export default function App() {
   }, [groupedSlots, searchQuery, awbIndex]);
 
   /* =========================
-     EINLAGERN -> putaway
+     Einlagern: Putaway
 ========================= */
   const doInboundPutaway = async () => {
     try {
@@ -575,6 +609,8 @@ export default function App() {
       });
 
       alert(`✅ Eingelagert in ${res.shelf}-L${res.level}`);
+
+      // Reset to place + restart automatically
       await resetInboundAll();
       setActiveTab("inventory");
     } catch (e) {
@@ -596,7 +632,67 @@ export default function App() {
   const suggestedSteg = stegCandidates[0] || "";
 
   /* =========================
-     MOVE (QR slot only)
+     OUTBOUND (remove stock)
+========================= */
+  const entryOptions = useMemo(() => {
+    const shelfNum = (s) => Number(String(s).replace("C", "")) || 0;
+    const arr = itemDocs.map((x) => ({
+      entryId: `${x.slotId}__${safeDocId(x.itemKey)}`,
+      slotId: x.slotId,
+      shelf: x.shelf,
+      level: x.level,
+      itemKey: x.itemKey,
+      quantity: x.quantity,
+    }));
+    arr.sort((a, b) => {
+      const ds = shelfNum(a.shelf) - shelfNum(b.shelf);
+      if (ds !== 0) return ds;
+      const dl = b.level - a.level;
+      if (dl !== 0) return dl;
+      return String(a.itemKey).localeCompare(String(b.itemKey));
+    });
+    return arr;
+  }, [itemDocs]);
+
+  const [outStock, setOutStock] = useState({
+    entryId: "",
+    qty: "",
+    destination: "produktion",
+  });
+
+  const handleRemoveStock = async (e) => {
+    e.preventDefault();
+    const qty = Number(outStock.qty);
+    if (!outStock.entryId || !qty || qty <= 0) return;
+
+    const selected = entryOptions.find((x) => x.entryId === outStock.entryId);
+    if (!selected) return;
+
+    if (selected.quantity < qty) {
+      alert("❗ Entnahmemenge ist größer als der aktuelle Bestand.");
+      return;
+    }
+
+    const iRef = itemDocRef(selected.slotId, selected.itemKey);
+    try {
+      const newQty = selected.quantity - qty;
+      if (newQty <= 0) await deleteDoc(iRef);
+      else
+        await updateDoc(iRef, {
+          quantity: newQty,
+          updatedAt: Date.now(),
+          lastDestination: outStock.destination,
+        });
+
+      setOutStock({ entryId: "", qty: "", destination: "produktion" });
+      setActiveTab("inventory");
+    } catch (err) {
+      console.error("Remove error:", err);
+    }
+  };
+
+  /* =========================
+     MOVE (QR SLOT ONLY)
 ========================= */
   const [qrSource, setQrSource] = useState({ shelf: null, level: null });
   const [qrTarget, setQrTarget] = useState({ shelf: null, level: null });
@@ -609,7 +705,7 @@ export default function App() {
   const stepRef = useRef("source");
   const ignoreUntilRef = useRef(0);
 
-  const resetAll = () => {
+  const resetMoveAll = () => {
     stepRef.current = "source";
     setQrSource({ shelf: null, level: null });
     setQrTarget({ shelf: null, level: null });
@@ -632,7 +728,6 @@ export default function App() {
 
   const applyScan = (raw) => {
     if (moving || confirmOpen) return;
-
     const now = Date.now();
     if (now < ignoreUntilRef.current) return;
 
@@ -650,8 +745,10 @@ export default function App() {
 
     const step = stepRef.current;
     const cooldownAfterSourceMs = 1200;
-    const sourceSetAtRef = applyScan.sourceSetAtRef || (applyScan.sourceSetAtRef = { t: 0 });
-    const sourceShelfRef = applyScan.sourceShelfRef || (applyScan.sourceShelfRef = { shelf: null });
+    const sourceSetAtRef =
+      applyScan.sourceSetAtRef || (applyScan.sourceSetAtRef = { t: 0 });
+    const sourceShelfRef =
+      applyScan.sourceShelfRef || (applyScan.sourceShelfRef = { shelf: null });
 
     if (step === "source") {
       const lvl = parsed.level ?? findTopOccupiedLevel(slotMap, parsed.shelf, levels);
@@ -708,7 +805,7 @@ export default function App() {
       });
 
       alert(`✅ Umlagerung fertig.\nSorten verschoben: ${res.movedTypes}`);
-      resetAll();
+      resetMoveAll();
       setActiveTab("inventory");
     } catch (e) {
       console.error(e);
@@ -901,7 +998,7 @@ export default function App() {
           </div>
         )}
 
-        {/* EINLAGERN */}
+        {/* EINGANG / EINLAGERN */}
         {activeTab === "add" && (
           <div className="space-y-4">
             <div className="bg-white p-7 rounded-[2.5rem] shadow-xl border border-slate-200 space-y-5">
@@ -911,10 +1008,10 @@ export default function App() {
                 </div>
                 <div className="min-w-0">
                   <h3 className="font-black uppercase text-slate-800 italic text-xl leading-tight">
-                    Einlagern (Platz → Barcode)
+                    Einlagern (Auto Start)
                   </h3>
                   <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
-                    Platz scannen → Scanner stoppt → Barcode scannen → Scanner stoppt
+                    Platz scannen → Auto Wechsel zu Barcode → Einlagern
                   </p>
                 </div>
               </div>
@@ -926,33 +1023,24 @@ export default function App() {
                   value={inPlace?.shelf ? `${inPlace.shelf}${inPlace.level ? `-L${inPlace.level}` : ""}` : "—"}
                   tone={inPlace?.shelf ? "emerald" : "slate"}
                 />
-                <StatChip label="Steg" value={inbound.itemKey ? inbound.itemKey : "—"} tone={inbound.itemKey ? "emerald" : "slate"} />
-              </div>
-
-              <div className="bg-emerald-50 border border-emerald-200 rounded-2xl p-4">
-                <div className="text-[10px] font-black uppercase text-emerald-700 tracking-widest mb-1">
-                  {inStep === "place" ? "Jetzt Platz-QR scannen" : "Jetzt Barcode scannen"}
-                </div>
-                <div className="text-[10px] font-bold text-emerald-900/80">
-                  Scanner stoppt nach jedem erfolgreichen Scan automatisch.
-                </div>
+                <StatChip label="Steg" value={inbound.itemKey || "—"} tone={inbound.itemKey ? "emerald" : "slate"} />
               </div>
 
               <QRScanner
                 ref={inboundScannerRef}
                 enabled={activeTab === "add"}
+                autoStart={true} // ✅ startet automatisch im Tab Eingang
                 onResult={(txt) => {
-                  // ignore window (after switching)
                   if (Date.now() < inboundIgnoreUntilRef.current) return;
 
-                  // if place already set => always barcode mode
+                  // ✅ wenn Platz schon gesetzt, IMMER barcode
                   if (inPlace?.shelf) {
                     onScanBarcodeForInbound(txt);
                     return;
                   }
 
-                  const step = inStepRef.current;
-                  if (step === "place") onScanPlaceForInbound(txt);
+                  // sonst nach Schritt
+                  if (inStepRef.current === "place") onScanPlaceForInbound(txt);
                   else onScanBarcodeForInbound(txt);
                 }}
                 onError={() => {}}
@@ -961,32 +1049,14 @@ export default function App() {
               <div className="flex gap-2">
                 <button
                   type="button"
-                  onClick={async () => {
-                    await inboundScannerRef.current?.stop?.();
-                    setInPlace(null);
-                    setInStep("place");
-                    inStepRef.current = "place";
-                    setBarcodeRaw("");
-                    setInbound((x) => ({ ...x, itemKey: "", lengthMm: "", qty: "", extra: "" }));
-                    inboundIgnoreUntilRef.current = Date.now() + 800;
-                    setTimeout(() => inboundScannerRef.current?.start?.(), 350);
-                  }}
+                  onClick={resetInboundToPlace}
                   className="flex-1 py-3 bg-slate-100 rounded-xl font-black text-[11px] text-slate-700"
                 >
                   Platz neu scannen
                 </button>
-
                 <button
                   type="button"
-                  onClick={async () => {
-                    await inboundScannerRef.current?.stop?.();
-                    setInStep("barcode");
-                    inStepRef.current = "barcode";
-                    setBarcodeRaw("");
-                    setInbound((x) => ({ ...x, itemKey: "", lengthMm: "", qty: "", extra: "" }));
-                    inboundIgnoreUntilRef.current = Date.now() + 800;
-                    setTimeout(() => inboundScannerRef.current?.start?.(), 350);
-                  }}
+                  onClick={resetInboundToBarcode}
                   className="flex-1 py-3 bg-slate-100 rounded-xl font-black text-[11px] text-slate-700"
                 >
                   Barcode neu scannen
@@ -1037,15 +1107,13 @@ export default function App() {
                   onClick={doInboundPutaway}
                   disabled={!canPutaway}
                   className={`w-full py-4 rounded-[1.2rem] font-black uppercase text-white shadow-lg active:scale-95 transition-all ${
-                    canPutaway ? "bg-emerald-600 shadow-emerald-600/20" : "bg-slate-300 shadow-none cursor-not-allowed"
+                    canPutaway
+                      ? "bg-emerald-600 shadow-emerald-600/20"
+                      : "bg-slate-300 shadow-none cursor-not-allowed"
                   }`}
                 >
                   Einlagern bestätigen
                 </button>
-
-                <div className="text-[10px] text-slate-500 font-bold text-center">
-                  Wenn du nur <b>C1</b> scannst: Einlagerung in die <b>unterste freie Ebene</b> von C1.
-                </div>
               </div>
 
               <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-3">
@@ -1097,7 +1165,7 @@ export default function App() {
           </div>
         )}
 
-        {/* MOVE */}
+        {/* UMLAGERN */}
         {activeTab === "move" && (
           <div className="space-y-4">
             <div className="bg-white p-7 rounded-[2.5rem] shadow-xl border border-slate-200 space-y-5">
@@ -1175,7 +1243,7 @@ export default function App() {
                 </div>
               ) : null}
 
-              <QRScanner enabled={scannerEnabled} onResult={applyScan} onError={() => {}} />
+              <QRScanner enabled={scannerEnabled} autoStart={true} onResult={applyScan} onError={() => {}} />
 
               <div className="flex gap-2">
                 <button
@@ -1210,7 +1278,9 @@ export default function App() {
                     onClick={() => applyScan(qrTextFallback)}
                     disabled={moving || confirmOpen}
                     className={`px-10 py-3 rounded-xl font-black active:scale-95 transition-all ${
-                      moving || confirmOpen ? "bg-slate-300 text-white cursor-not-allowed" : "bg-slate-900 text-yellow-500"
+                      moving || confirmOpen
+                        ? "bg-slate-300 text-white cursor-not-allowed"
+                        : "bg-slate-900 text-yellow-500"
                     }`}
                   >
                     Anwenden
