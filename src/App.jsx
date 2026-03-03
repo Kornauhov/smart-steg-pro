@@ -1,4 +1,3 @@
-// src/App.jsx
 import React, {
   useEffect,
   useMemo,
@@ -41,6 +40,7 @@ function parsePlace(text) {
 }
 
 /**
+ * Etikett-Barcode (30 Ziffern)
  * Beispiel: 030000024438160000011600004316
  * - StegNr  = digits[7..13)  => 244381
  * - Länge   = digits[13..17) => 6000
@@ -212,9 +212,6 @@ const QRScanner = forwardRef(function QRScanner(
   );
 });
 
-/* =========================
-   App
-========================= */
 export default function App() {
   const [activeTab, setActiveTab] = useState("dashboard");
   const [loading, setLoading] = useState(true);
@@ -234,9 +231,6 @@ export default function App() {
 
   /* =========================
      EINLAGERN (AutoStart + AutoSwitch)
-     - Tab Eingang startet automatisch
-     - Platz-Scan -> stop -> step=barcode -> ignore -> start
-     - Barcode-Scan -> stop (damit nicht doppelt scannt)
 ========================= */
   const inboundScannerRef = useRef(null);
 
@@ -260,6 +254,24 @@ export default function App() {
   });
 
   const [manualStegQuery, setManualStegQuery] = useState("");
+
+  const resetInboundAll = async () => {
+    await inboundScannerRef.current?.stop?.();
+    setInStep("place");
+    inStepRef.current = "place";
+    setInPlace(null);
+    setBarcodeRaw("");
+    setManualStegQuery("");
+    setInbound({
+      itemKey: "",
+      lengthMm: "",
+      qty: "",
+      deliveryDate: new Date().toISOString().slice(0, 10),
+      extra: "",
+    });
+    inboundIgnoreUntilRef.current = Date.now() + 500;
+    setTimeout(() => inboundScannerRef.current?.start?.(), 250);
+  };
 
   const resetInboundToPlace = async () => {
     await inboundScannerRef.current?.stop?.();
@@ -286,24 +298,6 @@ export default function App() {
     setTimeout(() => inboundScannerRef.current?.start?.(), 250);
   };
 
-  const resetInboundAll = async () => {
-    await inboundScannerRef.current?.stop?.();
-    setInStep("place");
-    inStepRef.current = "place";
-    setInPlace(null);
-    setBarcodeRaw("");
-    setManualStegQuery("");
-    setInbound({
-      itemKey: "",
-      lengthMm: "",
-      qty: "",
-      deliveryDate: new Date().toISOString().slice(0, 10),
-      extra: "",
-    });
-    inboundIgnoreUntilRef.current = Date.now() + 500;
-    setTimeout(() => inboundScannerRef.current?.start?.(), 250);
-  };
-
   const onScanPlaceForInbound = async (decodedText) => {
     const p = parsePlace(decodedText);
     if (!p) {
@@ -313,20 +307,18 @@ export default function App() {
 
     setInPlace(p);
 
-    // ✅ sofort barcode mode (ref sofort!)
+    // ✅ sofort barcode mode
     setInStep("barcode");
     inStepRef.current = "barcode";
 
-    // ✅ ignore next frames (avoid scanning same QR again)
+    // ✅ ignore next frames
     inboundIgnoreUntilRef.current = Date.now() + 900;
 
     // ✅ stop and restart scanner -> clean switch
     await inboundScannerRef.current?.stop?.();
     setTimeout(() => inboundScannerRef.current?.start?.(), 250);
 
-    try {
-      navigator.vibrate?.(30);
-    } catch {}
+    try { navigator.vibrate?.(30); } catch {}
   };
 
   const onScanBarcodeForInbound = async (decodedText) => {
@@ -352,9 +344,7 @@ export default function App() {
     await inboundScannerRef.current?.stop?.();
     inboundIgnoreUntilRef.current = Date.now() + 600;
 
-    try {
-      navigator.vibrate?.([30, 30]);
-    } catch {}
+    try { navigator.vibrate?.([30, 30]); } catch {}
   };
 
   const reqMissing = useMemo(() => {
@@ -610,7 +600,6 @@ export default function App() {
 
       alert(`✅ Eingelagert in ${res.shelf}-L${res.level}`);
 
-      // Reset to place + restart automatically
       await resetInboundAll();
       setActiveTab("inventory");
     } catch (e) {
@@ -632,7 +621,7 @@ export default function App() {
   const suggestedSteg = stegCandidates[0] || "";
 
   /* =========================
-     OUTBOUND (remove stock)
+     OUTBOUND
 ========================= */
   const entryOptions = useMemo(() => {
     const shelfNum = (s) => Number(String(s).replace("C", "")) || 0;
@@ -946,12 +935,6 @@ export default function App() {
               </div>
             </div>
 
-            <div className="flex items-center justify-between px-1">
-              <div className="text-[11px] font-bold text-slate-500">
-                Treffer: <span className="text-slate-900">{filteredSlots.length}</span>
-              </div>
-            </div>
-
             <div className="space-y-3">
               {filteredSlots.length === 0 ? (
                 <div className="bg-white p-6 rounded-[2rem] shadow-sm border border-slate-200 text-slate-500 font-bold italic">
@@ -1008,10 +991,10 @@ export default function App() {
                 </div>
                 <div className="min-w-0">
                   <h3 className="font-black uppercase text-slate-800 italic text-xl leading-tight">
-                    Einlagern (Auto Start)
+                    Einlagern (QR → Barcode)
                   </h3>
                   <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
-                    Platz scannen → Auto Wechsel zu Barcode → Einlagern
+                    Platz scannen → Barcode scannen → Bestätigen
                   </p>
                 </div>
               </div>
@@ -1029,17 +1012,16 @@ export default function App() {
               <QRScanner
                 ref={inboundScannerRef}
                 enabled={activeTab === "add"}
-                autoStart={true} // ✅ startet automatisch im Tab Eingang
+                autoStart={true}
                 onResult={(txt) => {
                   if (Date.now() < inboundIgnoreUntilRef.current) return;
 
-                  // ✅ wenn Platz schon gesetzt, IMMER barcode
+                  // ✅ WICHTIG: wenn Platz schon gescannt ist -> IMMER Barcode
                   if (inPlace?.shelf) {
                     onScanBarcodeForInbound(txt);
                     return;
                   }
 
-                  // sonst nach Schritt
                   if (inStepRef.current === "place") onScanPlaceForInbound(txt);
                   else onScanBarcodeForInbound(txt);
                 }}
