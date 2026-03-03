@@ -14,7 +14,11 @@ import {
   query,
   updateDoc,
 } from "firebase/firestore";
-import { onAuthStateChanged, signInAnonymously } from "firebase/auth";
+import {
+  onAuthStateChanged,
+  signInWithEmailAndPassword,
+  signOut,
+} from "firebase/auth";
 
 import { Html5Qrcode } from "html5-qrcode";
 
@@ -78,6 +82,64 @@ function findBottomEmptyLevel(slotMap, shelf, levelsTopDown) {
     if (!entries.length) return lvl;
   }
   return null;
+}
+
+/* =========================
+   Login Card
+========================= */
+function LoginCard({ onLogin, busy, error }) {
+  const [email, setEmail] = useState("");
+  const [pw, setPw] = useState("");
+
+  return (
+    <div className="bg-white p-7 rounded-[2.5rem] shadow-xl border border-slate-200 space-y-4">
+      <div>
+        <div className="text-[11px] font-black uppercase text-slate-400 tracking-widest">
+          Mitarbeiter Login
+        </div>
+        <div className="text-2xl font-black text-slate-900 italic">Anmelden</div>
+        <div className="text-xs font-bold text-slate-500 mt-1">
+          Ohne Login kannst du nur ansehen.
+        </div>
+      </div>
+
+      <input
+        value={email}
+        onChange={(e) => setEmail(e.target.value)}
+        placeholder="Email"
+        className="w-full p-4 bg-slate-50 rounded-2xl font-bold border-2 border-slate-100 outline-none focus:border-yellow-400"
+      />
+      <input
+        value={pw}
+        onChange={(e) => setPw(e.target.value)}
+        placeholder="Passwort"
+        type="password"
+        className="w-full p-4 bg-slate-50 rounded-2xl font-bold border-2 border-slate-100 outline-none focus:border-yellow-400"
+      />
+
+      {error ? (
+        <div className="text-sm font-bold text-rose-700 bg-rose-50 border border-rose-200 rounded-2xl p-3">
+          {error}
+        </div>
+      ) : null}
+
+      <button
+        disabled={busy || !email || !pw}
+        onClick={() => onLogin(email, pw)}
+        className={`w-full py-4 rounded-[1.2rem] font-black uppercase text-white shadow-lg active:scale-95 transition-all ${
+          busy || !email || !pw
+            ? "bg-slate-300 cursor-not-allowed shadow-none"
+            : "bg-slate-900 shadow-slate-900/20"
+        }`}
+      >
+        {busy ? "Anmelden..." : "Login"}
+      </button>
+
+      <div className="text-[10px] text-slate-500 font-bold text-center">
+        Rollen: Admin • Planung • Versorger
+      </div>
+    </div>
+  );
 }
 
 /* =========================
@@ -215,7 +277,12 @@ const QRScanner = forwardRef(function QRScanner(
 export default function App() {
   const [activeTab, setActiveTab] = useState("dashboard");
   const [loading, setLoading] = useState(true);
+
+  // Auth
   const [user, setUser] = useState(null);
+  const [role, setRole] = useState("guest"); // guest | versorger | planung | admin
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authError, setAuthError] = useState("");
 
   // Data
   const [rawItems, setRawItems] = useState([]);
@@ -228,6 +295,58 @@ export default function App() {
     []
   );
   const levels = [5, 4, 3, 2, 1];
+
+  const refreshRole = async (u) => {
+    if (!u) {
+      setRole("guest");
+      return;
+    }
+    try {
+      const tok = await u.getIdTokenResult(true);
+      const r = tok?.claims?.role ? String(tok.claims.role) : "guest";
+      setRole(r);
+    } catch {
+      setRole("guest");
+    }
+  };
+
+  const doLogin = async (email, pw) => {
+    setAuthError("");
+    setAuthBusy(true);
+    try {
+      const cred = await signInWithEmailAndPassword(auth, email, pw);
+      setUser(cred.user);
+      await refreshRole(cred.user);
+      setActiveTab("dashboard");
+    } catch (e) {
+      console.error(e);
+      setAuthError("Login fehlgeschlagen. Email/Passwort prüfen.");
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const doLogout = async () => {
+    try {
+      await signOut(auth);
+    } finally {
+      setUser(null);
+      setRole("guest");
+      setActiveTab("dashboard");
+    }
+  };
+
+  const canWriteStock =
+    role === "versorger" || role === "planung" || role === "admin";
+
+  const goTab = (t) => {
+    const protectedTabs = new Set(["add", "move", "outbound"]);
+    if (protectedTabs.has(t) && !canWriteStock) {
+      setActiveTab("dashboard"); // bleibt sichtbar, aber führt zurück
+      return;
+    }
+    setActiveTab(t);
+  };
 
   /* =========================
      EINLAGERN (AutoStart + AutoSwitch)
@@ -318,7 +437,9 @@ export default function App() {
     await inboundScannerRef.current?.stop?.();
     setTimeout(() => inboundScannerRef.current?.start?.(), 250);
 
-    try { navigator.vibrate?.(30); } catch {}
+    try {
+      navigator.vibrate?.(30);
+    } catch {}
   };
 
   const onScanBarcodeForInbound = async (decodedText) => {
@@ -344,7 +465,9 @@ export default function App() {
     await inboundScannerRef.current?.stop?.();
     inboundIgnoreUntilRef.current = Date.now() + 600;
 
-    try { navigator.vibrate?.([30, 30]); } catch {}
+    try {
+      navigator.vibrate?.([30, 30]);
+    } catch {}
   };
 
   const reqMissing = useMemo(() => {
@@ -357,31 +480,23 @@ export default function App() {
   }, [inPlace, inbound]);
 
   const canPutaway =
+    canWriteStock &&
     !reqMissing.place &&
     !reqMissing.itemKey &&
     !reqMissing.qty &&
     !reqMissing.lengthMm;
 
   /* =========================
-     Auth init
+     Auth init (Email/Passwort + Guest)
 ========================= */
   useEffect(() => {
-    const init = async () => {
-      try {
-        await signInAnonymously(auth);
-      } catch (e) {
-        console.error("Auth Error:", e);
-      }
-    };
-    init();
-
-    const unsub = onAuthStateChanged(auth, (u) => {
-      if (u) {
-        setUser(u);
-        setLoading(false);
-      }
+    const unsub = onAuthStateChanged(auth, async (u) => {
+      setUser(u || null);
+      await refreshRole(u || null);
+      setLoading(false);
     });
     return () => unsub();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -390,10 +505,12 @@ export default function App() {
 
   /* =========================
      Firestore subscriptions
+     - Für Gäste: READ ist erlaubt (Rules)
+     - Für eingeloggte: auch read
 ========================= */
   useEffect(() => {
-    if (!user) return;
-
+    // Wir laden Daten auch ohne Login (guest view).
+    // Falls du lesen NUR mit Auth willst -> Rules ändern und hier: if (!user) return;
     const itemsQ = query(collectionGroup(db, "items"));
     const unsubItems = onSnapshot(
       itemsQ,
@@ -434,7 +551,7 @@ export default function App() {
       unsubSteg();
       unsubMaster();
     };
-  }, [user]);
+  }, []);
 
   /* =========================
      Normalize item docs
@@ -453,7 +570,9 @@ export default function App() {
       const shelf = d.shelf ?? d.location?.shelf ?? derived.shelf;
       const level = Number(d.level ?? d.location?.level ?? derived.level);
       const slotId =
-        d.slotId ?? derived.slotId ?? (shelf && level ? slotIdFrom(shelf, level) : null);
+        d.slotId ??
+        derived.slotId ??
+        (shelf && level ? slotIdFrom(shelf, level) : null);
 
       const itemKey = d.itemKey ?? d.key ?? d.code ?? d.__id;
       const quantity = Number(d.quantity) || 0;
@@ -568,6 +687,7 @@ export default function App() {
 ========================= */
   const doInboundPutaway = async () => {
     try {
+      if (!canWriteStock) return alert("❗ Bitte als Mitarbeiter anmelden (Versorger/Planung/Admin).");
       if (!inPlace?.shelf) return alert("Bitte zuerst Platz scannen.");
 
       const itemKey = String(inbound.itemKey || "").trim();
@@ -651,6 +771,8 @@ export default function App() {
 
   const handleRemoveStock = async (e) => {
     e.preventDefault();
+    if (!canWriteStock) return alert("❗ Bitte als Mitarbeiter anmelden (Versorger/Planung/Admin).");
+
     const qty = Number(outStock.qty);
     if (!outStock.entryId || !qty || qty <= 0) return;
 
@@ -677,6 +799,7 @@ export default function App() {
       setActiveTab("inventory");
     } catch (err) {
       console.error("Remove error:", err);
+      alert("❗ Fehler beim Auslagern (Konsole prüfen).");
     }
   };
 
@@ -716,6 +839,7 @@ export default function App() {
   };
 
   const applyScan = (raw) => {
+    if (!canWriteStock) return;
     if (moving || confirmOpen) return;
     const now = Date.now();
     if (now < ignoreUntilRef.current) return;
@@ -753,7 +877,9 @@ export default function App() {
       sourceSetAtRef.t = Date.now();
 
       ignoreUntilRef.current = Date.now() + cooldownAfterSourceMs;
-      try { navigator.vibrate?.(30); } catch {}
+      try {
+        navigator.vibrate?.(30);
+      } catch {}
       return;
     }
 
@@ -774,10 +900,13 @@ export default function App() {
 
     setQrTarget({ shelf: parsed.shelf, level: lvl });
     setConfirmOpen(true);
-    try { navigator.vibrate?.([30, 30, 30]); } catch {}
+    try {
+      navigator.vibrate?.([30, 30, 30]);
+    } catch {}
   };
 
   const doMove = async () => {
+    if (!canWriteStock) return alert("❗ Bitte als Mitarbeiter anmelden (Versorger/Planung/Admin).");
     if (!qrSource.shelf || !qrTarget.shelf) return;
 
     setMoving(true);
@@ -806,7 +935,8 @@ export default function App() {
     }
   };
 
-  const scannerEnabled = activeTab === "move" && !confirmOpen && !moving;
+  const scannerEnabled =
+    canWriteStock && activeTab === "move" && !confirmOpen && !moving;
 
   /* =========================
      Loading
@@ -820,14 +950,34 @@ export default function App() {
     );
   }
 
+  const roleLabel =
+    role === "admin"
+      ? "ADMIN"
+      : role === "planung"
+      ? "PLANUNG"
+      : role === "versorger"
+      ? "VERSORGER"
+      : "GAST";
+
   return (
     <div className="max-w-4xl mx-auto min-h-screen pb-36 relative">
       {DEBUG && (
         <div className="fixed top-3 right-3 z-[999] bg-white/90 backdrop-blur border border-slate-200 shadow-lg rounded-2xl px-4 py-3 text-[11px] font-bold text-slate-700">
-          <div>RAW docs: <span className="text-slate-900">{rawItems.length}</span></div>
-          <div>APP docs: <span className="text-slate-900">{itemDocs.length}</span></div>
-          <div>Slots: <span className="text-slate-900">{occupiedSlots}</span></div>
-          <div>Sum qty: <span className="text-slate-900">{totalParts}</span></div>
+          <div>
+            RAW docs: <span className="text-slate-900">{rawItems.length}</span>
+          </div>
+          <div>
+            APP docs: <span className="text-slate-900">{itemDocs.length}</span>
+          </div>
+          <div>
+            Slots: <span className="text-slate-900">{occupiedSlots}</span>
+          </div>
+          <div>
+            Sum qty: <span className="text-slate-900">{totalParts}</span>
+          </div>
+          <div className="mt-2">
+            Role: <span className="text-slate-900">{roleLabel}</span>
+          </div>
         </div>
       )}
 
@@ -840,7 +990,34 @@ export default function App() {
             <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mt-1">
               Lagerverwaltung Kran-Gestell
             </p>
+
+            <div className="mt-2 flex items-center gap-2">
+              <span
+                className={`text-[10px] font-black uppercase px-3 py-1 rounded-full border ${
+                  role === "guest"
+                    ? "bg-slate-800 text-slate-300 border-slate-700"
+                    : "bg-yellow-500 text-slate-900 border-yellow-400"
+                }`}
+              >
+                {roleLabel}
+              </span>
+
+              {user ? (
+                <button
+                  type="button"
+                  onClick={doLogout}
+                  className="text-[10px] font-black uppercase px-3 py-1 rounded-full bg-slate-800 border border-slate-700 text-slate-200 active:scale-95"
+                >
+                  Logout
+                </button>
+              ) : (
+                <span className="text-[10px] font-bold text-slate-500">
+                  (nur Ansicht)
+                </span>
+              )}
+            </div>
           </div>
+
           <div className="bg-slate-800 p-3 rounded-2xl text-yellow-500 shadow-inner">
             <Icon name="factory" size={24} />
           </div>
@@ -851,6 +1028,10 @@ export default function App() {
         {/* DASHBOARD */}
         {activeTab === "dashboard" && (
           <div className="space-y-6">
+            {role === "guest" ? (
+              <LoginCard onLogin={doLogin} busy={authBusy} error={authError} />
+            ) : null}
+
             <div className="grid grid-cols-3 gap-3">
               <div className="bg-white p-4 rounded-3xl shadow-sm border border-slate-200">
                 <p className="text-[9px] font-black text-slate-400 uppercase mb-1">Stege DB</p>
@@ -984,370 +1165,384 @@ export default function App() {
         {/* EINGANG / EINLAGERN */}
         {activeTab === "add" && (
           <div className="space-y-4">
-            <div className="bg-white p-7 rounded-[2.5rem] shadow-xl border border-slate-200 space-y-5">
-              <div className="flex items-center gap-3">
-                <div className="p-2 bg-emerald-100 text-emerald-600 rounded-xl">
-                  <Icon name="arrow-down-to-dot" />
+            {!canWriteStock ? (
+              <LoginCard onLogin={doLogin} busy={authBusy} error={authError} />
+            ) : (
+              <div className="bg-white p-7 rounded-[2.5rem] shadow-xl border border-slate-200 space-y-5">
+                <div className="flex items-center gap-3">
+                  <div className="p-2 bg-emerald-100 text-emerald-600 rounded-xl">
+                    <Icon name="arrow-down-to-dot" />
+                  </div>
+                  <div className="min-w-0">
+                    <h3 className="font-black uppercase text-slate-800 italic text-xl leading-tight">
+                      Einlagern (QR → Barcode)
+                    </h3>
+                    <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+                      Platz scannen → Barcode scannen → Bestätigen
+                    </p>
+                  </div>
                 </div>
-                <div className="min-w-0">
-                  <h3 className="font-black uppercase text-slate-800 italic text-xl leading-tight">
-                    Einlagern (QR → Barcode)
-                  </h3>
-                  <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
-                    Platz scannen → Barcode scannen → Bestätigen
-                  </p>
+
+                <div className="flex gap-2 flex-wrap">
+                  <StatChip label="Schritt" value={inStep === "place" ? "Platz" : "Barcode"} tone="emerald" />
+                  <StatChip
+                    label="Platz"
+                    value={inPlace?.shelf ? `${inPlace.shelf}${inPlace.level ? `-L${inPlace.level}` : ""}` : "—"}
+                    tone={inPlace?.shelf ? "emerald" : "slate"}
+                  />
+                  <StatChip label="Steg" value={inbound.itemKey || "—"} tone={inbound.itemKey ? "emerald" : "slate"} />
                 </div>
-              </div>
 
-              <div className="flex gap-2 flex-wrap">
-                <StatChip label="Schritt" value={inStep === "place" ? "Platz" : "Barcode"} tone="emerald" />
-                <StatChip
-                  label="Platz"
-                  value={inPlace?.shelf ? `${inPlace.shelf}${inPlace.level ? `-L${inPlace.level}` : ""}` : "—"}
-                  tone={inPlace?.shelf ? "emerald" : "slate"}
-                />
-                <StatChip label="Steg" value={inbound.itemKey || "—"} tone={inbound.itemKey ? "emerald" : "slate"} />
-              </div>
+                <QRScanner
+                  ref={inboundScannerRef}
+                  enabled={activeTab === "add"}
+                  autoStart={true}
+                  onResult={(txt) => {
+                    if (Date.now() < inboundIgnoreUntilRef.current) return;
 
-              <QRScanner
-                ref={inboundScannerRef}
-                enabled={activeTab === "add"}
-                autoStart={true}
-                onResult={(txt) => {
-                  if (Date.now() < inboundIgnoreUntilRef.current) return;
+                    // ✅ WICHTIG: wenn Platz schon gescannt ist -> IMMER Barcode
+                    if (inPlace?.shelf) {
+                      onScanBarcodeForInbound(txt);
+                      return;
+                    }
 
-                  // ✅ WICHTIG: wenn Platz schon gescannt ist -> IMMER Barcode
-                  if (inPlace?.shelf) {
-                    onScanBarcodeForInbound(txt);
-                    return;
-                  }
-
-                  if (inStepRef.current === "place") onScanPlaceForInbound(txt);
-                  else onScanBarcodeForInbound(txt);
-                }}
-                onError={() => {}}
-              />
-
-              <div className="flex gap-2">
-                <button
-                  type="button"
-                  onClick={resetInboundToPlace}
-                  className="flex-1 py-3 bg-slate-100 rounded-xl font-black text-[11px] text-slate-700"
-                >
-                  Platz neu scannen
-                </button>
-                <button
-                  type="button"
-                  onClick={resetInboundToBarcode}
-                  className="flex-1 py-3 bg-slate-100 rounded-xl font-black text-[11px] text-slate-700"
-                >
-                  Barcode neu scannen
-                </button>
-              </div>
-
-              <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-2">
-                <div className="text-[10px] font-black uppercase text-slate-400">Barcode Roh</div>
-                <div className="text-[11px] font-bold text-slate-700 break-all">{barcodeRaw || "—"}</div>
-              </div>
-
-              <div className="bg-white border border-slate-200 rounded-2xl p-4 space-y-2">
-                <div className="text-[10px] font-black uppercase text-slate-400">Daten</div>
-
-                <input
-                  value={inbound.itemKey}
-                  onChange={(e) => setInbound((x) => ({ ...x, itemKey: e.target.value }))}
-                  placeholder="Steg Nr"
-                  className={`w-full p-3 rounded-2xl border-2 font-bold outline-none ${
-                    reqMissing.itemKey ? "border-red-400 bg-red-50" : "border-slate-100 bg-white"
-                  }`}
-                />
-                <input
-                  value={inbound.lengthMm}
-                  onChange={(e) => setInbound((x) => ({ ...x, lengthMm: e.target.value }))}
-                  placeholder="Länge (mm)"
-                  className={`w-full p-3 rounded-2xl border-2 font-bold outline-none ${
-                    reqMissing.lengthMm ? "border-red-400 bg-red-50" : "border-slate-100 bg-white"
-                  }`}
-                />
-                <input
-                  value={inbound.qty}
-                  onChange={(e) => setInbound((x) => ({ ...x, qty: e.target.value }))}
-                  placeholder="Menge"
-                  className={`w-full p-3 rounded-2xl border-2 font-bold outline-none ${
-                    reqMissing.qty ? "border-red-400 bg-red-50" : "border-slate-100 bg-white"
-                  }`}
-                />
-                <input
-                  type="date"
-                  value={inbound.deliveryDate}
-                  onChange={(e) => setInbound((x) => ({ ...x, deliveryDate: e.target.value }))}
-                  className="w-full p-3 rounded-2xl border-2 border-slate-100 font-bold outline-none"
+                    if (inStepRef.current === "place") onScanPlaceForInbound(txt);
+                    else onScanBarcodeForInbound(txt);
+                  }}
+                  onError={() => {}}
                 />
 
-                <button
-                  type="button"
-                  onClick={doInboundPutaway}
-                  disabled={!canPutaway}
-                  className={`w-full py-4 rounded-[1.2rem] font-black uppercase text-white shadow-lg active:scale-95 transition-all ${
-                    canPutaway
-                      ? "bg-emerald-600 shadow-emerald-600/20"
-                      : "bg-slate-300 shadow-none cursor-not-allowed"
-                  }`}
-                >
-                  Einlagern bestätigen
-                </button>
-              </div>
-
-              <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-3">
-                <div className="text-[10px] font-black uppercase text-slate-400">Manuell Steg auswählen</div>
-
-                <input
-                  value={manualStegQuery}
-                  onChange={(e) => setManualStegQuery(e.target.value)}
-                  placeholder="erste Zahlen tippen… z.B. 244"
-                  className="w-full p-3 bg-white rounded-xl font-bold border-2 border-slate-100 outline-none"
-                />
-
-                {suggestedSteg ? (
+                <div className="flex gap-2">
                   <button
                     type="button"
-                    onClick={() => setInbound((x) => ({ ...x, itemKey: suggestedSteg }))}
-                    className="w-full px-4 py-3 rounded-xl bg-white border border-slate-200 font-black text-left"
+                    onClick={resetInboundToPlace}
+                    className="flex-1 py-3 bg-slate-100 rounded-xl font-black text-[11px] text-slate-700"
                   >
-                    Vorschlag: <span className="text-emerald-700">{suggestedSteg}</span> (antippen)
+                    Platz neu scannen
                   </button>
-                ) : (
-                  <div className="text-xs font-bold text-slate-500">Kein Vorschlag</div>
-                )}
+                  <button
+                    type="button"
+                    onClick={resetInboundToBarcode}
+                    className="flex-1 py-3 bg-slate-100 rounded-xl font-black text-[11px] text-slate-700"
+                  >
+                    Barcode neu scannen
+                  </button>
+                </div>
 
-                {stegCandidates.length > 1 ? (
-                  <div className="grid grid-cols-2 gap-2">
-                    {stegCandidates.slice(1).map((k) => (
-                      <button
-                        key={k}
-                        type="button"
-                        onClick={() => setInbound((x) => ({ ...x, itemKey: k }))}
-                        className="px-3 py-2 rounded-xl bg-white border border-slate-200 font-bold text-sm"
-                      >
-                        {k}
-                      </button>
-                    ))}
-                  </div>
-                ) : null}
+                <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-2">
+                  <div className="text-[10px] font-black uppercase text-slate-400">Barcode Roh</div>
+                  <div className="text-[11px] font-bold text-slate-700 break-all">{barcodeRaw || "—"}</div>
+                </div>
+
+                <div className="bg-white border border-slate-200 rounded-2xl p-4 space-y-2">
+                  <div className="text-[10px] font-black uppercase text-slate-400">Daten</div>
+
+                  <input
+                    value={inbound.itemKey}
+                    onChange={(e) => setInbound((x) => ({ ...x, itemKey: e.target.value }))}
+                    placeholder="Steg Nr"
+                    className={`w-full p-3 rounded-2xl border-2 font-bold outline-none ${
+                      reqMissing.itemKey ? "border-red-400 bg-red-50" : "border-slate-100 bg-white"
+                    }`}
+                  />
+                  <input
+                    value={inbound.lengthMm}
+                    onChange={(e) => setInbound((x) => ({ ...x, lengthMm: e.target.value }))}
+                    placeholder="Länge (mm)"
+                    className={`w-full p-3 rounded-2xl border-2 font-bold outline-none ${
+                      reqMissing.lengthMm ? "border-red-400 bg-red-50" : "border-slate-100 bg-white"
+                    }`}
+                  />
+                  <input
+                    value={inbound.qty}
+                    onChange={(e) => setInbound((x) => ({ ...x, qty: e.target.value }))}
+                    placeholder="Menge"
+                    className={`w-full p-3 rounded-2xl border-2 font-bold outline-none ${
+                      reqMissing.qty ? "border-red-400 bg-red-50" : "border-slate-100 bg-white"
+                    }`}
+                  />
+                  <input
+                    type="date"
+                    value={inbound.deliveryDate}
+                    onChange={(e) => setInbound((x) => ({ ...x, deliveryDate: e.target.value }))}
+                    className="w-full p-3 rounded-2xl border-2 border-slate-100 font-bold outline-none"
+                  />
+
+                  <button
+                    type="button"
+                    onClick={doInboundPutaway}
+                    disabled={!canPutaway}
+                    className={`w-full py-4 rounded-[1.2rem] font-black uppercase text-white shadow-lg active:scale-95 transition-all ${
+                      canPutaway
+                        ? "bg-emerald-600 shadow-emerald-600/20"
+                        : "bg-slate-300 shadow-none cursor-not-allowed"
+                    }`}
+                  >
+                    Einlagern bestätigen
+                  </button>
+                </div>
+
+                <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-3">
+                  <div className="text-[10px] font-black uppercase text-slate-400">Manuell Steg auswählen</div>
+
+                  <input
+                    value={manualStegQuery}
+                    onChange={(e) => setManualStegQuery(e.target.value)}
+                    placeholder="erste Zahlen tippen… z.B. 244"
+                    className="w-full p-3 bg-white rounded-xl font-bold border-2 border-slate-100 outline-none"
+                  />
+
+                  {suggestedSteg ? (
+                    <button
+                      type="button"
+                      onClick={() => setInbound((x) => ({ ...x, itemKey: suggestedSteg }))}
+                      className="w-full px-4 py-3 rounded-xl bg-white border border-slate-200 font-black text-left"
+                    >
+                      Vorschlag: <span className="text-emerald-700">{suggestedSteg}</span> (antippen)
+                    </button>
+                  ) : (
+                    <div className="text-xs font-bold text-slate-500">Kein Vorschlag</div>
+                  )}
+
+                  {stegCandidates.length > 1 ? (
+                    <div className="grid grid-cols-2 gap-2">
+                      {stegCandidates.slice(1).map((k) => (
+                        <button
+                          key={k}
+                          type="button"
+                          onClick={() => setInbound((x) => ({ ...x, itemKey: k }))}
+                          className="px-3 py-2 rounded-xl bg-white border border-slate-200 font-bold text-sm"
+                        >
+                          {k}
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+
+                <button
+                  type="button"
+                  onClick={resetInboundAll}
+                  className="w-full py-3 bg-slate-900 text-yellow-500 rounded-xl font-black text-[11px] active:scale-95"
+                >
+                  Einlagern komplett zurücksetzen
+                </button>
               </div>
-
-              <button
-                type="button"
-                onClick={resetInboundAll}
-                className="w-full py-3 bg-slate-900 text-yellow-500 rounded-xl font-black text-[11px] active:scale-95"
-              >
-                Einlagern komplett zurücksetzen
-              </button>
-            </div>
+            )}
           </div>
         )}
 
         {/* UMLAGERN */}
         {activeTab === "move" && (
           <div className="space-y-4">
-            <div className="bg-white p-7 rounded-[2.5rem] shadow-xl border border-slate-200 space-y-5">
-              <div className="flex items-center gap-3">
-                <div className="p-2 bg-blue-100 text-blue-600 rounded-xl">
-                  <Icon name="qr-code" />
-                </div>
-                <div className="min-w-0">
-                  <h3 className="font-black uppercase text-slate-800 italic text-xl leading-tight">
-                    Umlagern (QR)
-                  </h3>
-                  <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
-                    Quelle scannen → Ziel scannen → Bestätigen
-                  </p>
-                </div>
-              </div>
-
-              <div className="flex gap-2 flex-wrap">
-                <StatChip
-                  label="Modus"
-                  value={stepRef.current === "source" ? "Quelle scannen" : "Ziel scannen"}
-                  tone="blue"
-                />
-                <StatChip
-                  label="Quelle"
-                  value={qrSource.shelf ? `${qrSource.shelf}-L${qrSource.level}` : "—"}
-                  tone={qrSource.shelf ? "emerald" : "slate"}
-                />
-                <StatChip
-                  label="Ziel"
-                  value={qrTarget.shelf ? `${qrTarget.shelf}-L${qrTarget.level}` : "—"}
-                  tone={qrTarget.shelf ? "emerald" : "slate"}
-                />
-              </div>
-
-              {confirmOpen && qrSource.shelf && qrTarget.shelf ? (
-                <div className="bg-blue-50 border border-blue-200 rounded-[1.5rem] p-4">
-                  <div className="text-[10px] font-black uppercase text-blue-700 tracking-widest mb-2">
-                    Umlagerung bestätigen
+            {!canWriteStock ? (
+              <LoginCard onLogin={doLogin} busy={authBusy} error={authError} />
+            ) : (
+              <div className="bg-white p-7 rounded-[2.5rem] shadow-xl border border-slate-200 space-y-5">
+                <div className="flex items-center gap-3">
+                  <div className="p-2 bg-blue-100 text-blue-600 rounded-xl">
+                    <Icon name="qr-code" />
                   </div>
+                  <div className="min-w-0">
+                    <h3 className="font-black uppercase text-slate-800 italic text-xl leading-tight">
+                      Umlagern (QR)
+                    </h3>
+                    <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+                      Quelle scannen → Ziel scannen → Bestätigen
+                    </p>
+                  </div>
+                </div>
 
-                  <div className="grid grid-cols-2 gap-3">
-                    <div className="bg-white border border-slate-200 rounded-2xl p-3">
-                      <div className="text-[10px] font-black uppercase text-slate-400">Quelle</div>
-                      <div className="font-black text-slate-900 text-lg">
-                        {qrSource.shelf}-L{qrSource.level}
+                <div className="flex gap-2 flex-wrap">
+                  <StatChip
+                    label="Modus"
+                    value={stepRef.current === "source" ? "Quelle scannen" : "Ziel scannen"}
+                    tone="blue"
+                  />
+                  <StatChip
+                    label="Quelle"
+                    value={qrSource.shelf ? `${qrSource.shelf}-L${qrSource.level}` : "—"}
+                    tone={qrSource.shelf ? "emerald" : "slate"}
+                  />
+                  <StatChip
+                    label="Ziel"
+                    value={qrTarget.shelf ? `${qrTarget.shelf}-L${qrTarget.level}` : "—"}
+                    tone={qrTarget.shelf ? "emerald" : "slate"}
+                  />
+                </div>
+
+                {confirmOpen && qrSource.shelf && qrTarget.shelf ? (
+                  <div className="bg-blue-50 border border-blue-200 rounded-[1.5rem] p-4">
+                    <div className="text-[10px] font-black uppercase text-blue-700 tracking-widest mb-2">
+                      Umlagerung bestätigen
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="bg-white border border-slate-200 rounded-2xl p-3">
+                        <div className="text-[10px] font-black uppercase text-slate-400">Quelle</div>
+                        <div className="font-black text-slate-900 text-lg">
+                          {qrSource.shelf}-L{qrSource.level}
+                        </div>
+                      </div>
+
+                      <div className="bg-white border border-slate-200 rounded-2xl p-3">
+                        <div className="text-[10px] font-black uppercase text-slate-400">Ziel</div>
+                        <div className="font-black text-slate-900 text-lg">
+                          {qrTarget.shelf}-L{qrTarget.level}
+                        </div>
                       </div>
                     </div>
 
-                    <div className="bg-white border border-slate-200 rounded-2xl p-3">
-                      <div className="text-[10px] font-black uppercase text-slate-400">Ziel</div>
-                      <div className="font-black text-slate-900 text-lg">
-                        {qrTarget.shelf}-L{qrTarget.level}
-                      </div>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        setConfirmOpen(false);
+                        await doMove();
+                      }}
+                      disabled={moving}
+                      className={`w-full mt-4 py-4 text-white rounded-[1.2rem] font-black uppercase shadow-lg active:scale-95 transition-all ${
+                        moving ? "bg-slate-400 shadow-none cursor-not-allowed" : "bg-blue-700 shadow-blue-700/20"
+                      }`}
+                    >
+                      {moving ? "Umlagern..." : "Bestätigen"}
+                    </button>
+
+                    <div className="mt-2 text-[10px] text-blue-700/80 font-bold text-center">
+                      Scanner ist pausiert bis zur Bestätigung.
                     </div>
                   </div>
+                ) : null}
 
+                <QRScanner enabled={scannerEnabled} autoStart={true} onResult={applyScan} onError={() => {}} />
+
+                <div className="flex gap-2">
                   <button
                     type="button"
-                    onClick={async () => {
-                      setConfirmOpen(false);
-                      await doMove();
-                    }}
-                    disabled={moving}
-                    className={`w-full mt-4 py-4 text-white rounded-[1.2rem] font-black uppercase shadow-lg active:scale-95 transition-all ${
-                      moving ? "bg-slate-400 shadow-none cursor-not-allowed" : "bg-blue-700 shadow-blue-700/20"
-                    }`}
+                    onClick={resetSource}
+                    className="flex-1 py-3 bg-slate-100 rounded-xl font-black text-[11px] text-slate-700"
                   >
-                    {moving ? "Umlagern..." : "Bestätigen"}
+                    Quelle zurücksetzen
                   </button>
+                  <button
+                    type="button"
+                    onClick={resetTarget}
+                    className="flex-1 py-3 bg-slate-100 rounded-xl font-black text-[11px] text-slate-700"
+                  >
+                    Ziel zurücksetzen
+                  </button>
+                </div>
 
-                  <div className="mt-2 text-[10px] text-blue-700/80 font-bold text-center">
-                    Scanner ist pausiert bis zur Bestätigung.
+                <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-3">
+                  <div className="text-[10px] font-black uppercase text-slate-400">Fallback</div>
+
+                  <input
+                    value={qrTextFallback}
+                    onChange={(e) => setQrTextFallback(e.target.value)}
+                    placeholder="z.B. C8 oder C8-L3"
+                    className="w-full p-3 bg-white rounded-xl font-bold border-2 border-slate-100 outline-none"
+                  />
+
+                  <div className="flex justify-center">
+                    <button
+                      type="button"
+                      onClick={() => applyScan(qrTextFallback)}
+                      disabled={moving || confirmOpen}
+                      className={`px-10 py-3 rounded-xl font-black active:scale-95 transition-all ${
+                        moving || confirmOpen
+                          ? "bg-slate-300 text-white cursor-not-allowed"
+                          : "bg-slate-900 text-yellow-500"
+                      }`}
+                    >
+                      Anwenden
+                    </button>
+                  </div>
+
+                  <div className="text-[10px] text-slate-500 font-bold text-center">
+                    Quelle: oberste belegte Ebene • Ziel: unterste freie Ebene
                   </div>
                 </div>
-              ) : null}
-
-              <QRScanner enabled={scannerEnabled} autoStart={true} onResult={applyScan} onError={() => {}} />
-
-              <div className="flex gap-2">
-                <button
-                  type="button"
-                  onClick={resetSource}
-                  className="flex-1 py-3 bg-slate-100 rounded-xl font-black text-[11px] text-slate-700"
-                >
-                  Quelle zurücksetzen
-                </button>
-                <button
-                  type="button"
-                  onClick={resetTarget}
-                  className="flex-1 py-3 bg-slate-100 rounded-xl font-black text-[11px] text-slate-700"
-                >
-                  Ziel zurücksetzen
-                </button>
               </div>
-
-              <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-3">
-                <div className="text-[10px] font-black uppercase text-slate-400">Fallback</div>
-
-                <input
-                  value={qrTextFallback}
-                  onChange={(e) => setQrTextFallback(e.target.value)}
-                  placeholder="z.B. C8 oder C8-L3"
-                  className="w-full p-3 bg-white rounded-xl font-bold border-2 border-slate-100 outline-none"
-                />
-
-                <div className="flex justify-center">
-                  <button
-                    type="button"
-                    onClick={() => applyScan(qrTextFallback)}
-                    disabled={moving || confirmOpen}
-                    className={`px-10 py-3 rounded-xl font-black active:scale-95 transition-all ${
-                      moving || confirmOpen
-                        ? "bg-slate-300 text-white cursor-not-allowed"
-                        : "bg-slate-900 text-yellow-500"
-                    }`}
-                  >
-                    Anwenden
-                  </button>
-                </div>
-
-                <div className="text-[10px] text-slate-500 font-bold text-center">
-                  Quelle: oberste belegte Ebene • Ziel: unterste freie Ebene
-                </div>
-              </div>
-            </div>
+            )}
           </div>
         )}
 
         {/* OUTBOUND */}
         {activeTab === "outbound" && (
-          <div className="bg-white p-8 rounded-[2.5rem] shadow-xl border border-slate-200 space-y-6">
-            <div className="flex items-center gap-3">
-              <div className="p-2 bg-rose-100 text-rose-600 rounded-xl">
-                <Icon name="arrow-up-right-from-circle" />
-              </div>
-              <h3 className="font-black uppercase text-slate-800 italic text-xl">Warenausgang</h3>
-            </div>
+          <div className="space-y-4">
+            {!canWriteStock ? (
+              <LoginCard onLogin={doLogin} busy={authBusy} error={authError} />
+            ) : (
+              <div className="bg-white p-8 rounded-[2.5rem] shadow-xl border border-slate-200 space-y-6">
+                <div className="flex items-center gap-3">
+                  <div className="p-2 bg-rose-100 text-rose-600 rounded-xl">
+                    <Icon name="arrow-up-right-from-circle" />
+                  </div>
+                  <h3 className="font-black uppercase text-slate-800 italic text-xl">Warenausgang</h3>
+                </div>
 
-            <form onSubmit={handleRemoveStock} className="space-y-5">
-              <div className="space-y-1">
-                <label className="text-[10px] font-black uppercase text-slate-400 ml-4">Eintrag wählen</label>
-                <select
-                  required
-                  value={outStock.entryId}
-                  onChange={(e) => setOutStock({ ...outStock, entryId: e.target.value })}
-                  className="w-full p-4 bg-slate-50 rounded-2xl font-bold border-2 border-slate-100 appearance-none outline-none focus:border-rose-400"
-                >
-                  <option value="">-- Bestand wählen --</option>
-                  {entryOptions.map((e) => (
-                    <option key={e.entryId} value={e.entryId}>
-                      {e.shelf}-L{e.level} | {e.itemKey} ({e.quantity} Stk)
-                    </option>
-                  ))}
-                </select>
-              </div>
+                <form onSubmit={handleRemoveStock} className="space-y-5">
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-black uppercase text-slate-400 ml-4">Eintrag wählen</label>
+                    <select
+                      required
+                      value={outStock.entryId}
+                      onChange={(e) => setOutStock({ ...outStock, entryId: e.target.value })}
+                      className="w-full p-4 bg-slate-50 rounded-2xl font-bold border-2 border-slate-100 appearance-none outline-none focus:border-rose-400"
+                    >
+                      <option value="">-- Bestand wählen --</option>
+                      {entryOptions.map((e) => (
+                        <option key={e.entryId} value={e.entryId}>
+                          {e.shelf}-L{e.level} | {e.itemKey} ({e.quantity} Stk)
+                        </option>
+                      ))}
+                    </select>
+                  </div>
 
-              <div className="space-y-1">
-                <label className="text-[10px] font-black uppercase text-slate-400 ml-4">Verwendung</label>
-                <select
-                  value={outStock.destination}
-                  onChange={(e) => setOutStock({ ...outStock, destination: e.target.value })}
-                  className="w-full p-4 bg-slate-50 rounded-2xl font-bold border-2 border-slate-100 outline-none"
-                >
-                  <option value="produktion">Produktion / Montage</option>
-                  <option value="ausschuss">Ausschuss / Defekt</option>
-                  <option value="inventur">Korrektur</option>
-                </select>
-              </div>
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-black uppercase text-slate-400 ml-4">Verwendung</label>
+                    <select
+                      value={outStock.destination}
+                      onChange={(e) => setOutStock({ ...outStock, destination: e.target.value })}
+                      className="w-full p-4 bg-slate-50 rounded-2xl font-bold border-2 border-slate-100 outline-none"
+                    >
+                      <option value="produktion">Produktion / Montage</option>
+                      <option value="ausschuss">Ausschuss / Defekt</option>
+                      <option value="inventur">Korrektur</option>
+                    </select>
+                  </div>
 
-              <div className="space-y-1">
-                <label className="text-[10px] font-black uppercase text-slate-400 ml-4">Entnahmemenge</label>
-                <input
-                  required
-                  type="number"
-                  min="1"
-                  placeholder="Menge..."
-                  value={outStock.qty}
-                  onChange={(e) => setOutStock({ ...outStock, qty: e.target.value })}
-                  className="w-full p-4 bg-slate-50 rounded-2xl font-bold border-2 border-slate-100 outline-none focus:border-rose-400"
-                />
-              </div>
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-black uppercase text-slate-400 ml-4">Entnahmemenge</label>
+                    <input
+                      required
+                      type="number"
+                      min="1"
+                      placeholder="Menge..."
+                      value={outStock.qty}
+                      onChange={(e) => setOutStock({ ...outStock, qty: e.target.value })}
+                      className="w-full p-4 bg-slate-50 rounded-2xl font-bold border-2 border-slate-100 outline-none focus:border-rose-400"
+                    />
+                  </div>
 
-              <button
-                type="submit"
-                className="w-full py-5 bg-rose-600 text-white rounded-[1.5rem] font-black uppercase shadow-lg shadow-rose-600/20 active:scale-95 transition-all sticky bottom-4"
-              >
-                Auslagern bestätigen
-              </button>
-            </form>
+                  <button
+                    type="submit"
+                    className="w-full py-5 bg-rose-600 text-white rounded-[1.5rem] font-black uppercase shadow-lg shadow-rose-600/20 active:scale-95 transition-all sticky bottom-4"
+                  >
+                    Auslagern bestätigen
+                  </button>
+                </form>
+              </div>
+            )}
           </div>
         )}
       </main>
 
       <nav className="fixed bottom-5 left-1/2 -translate-x-1/2 w-[94%] max-w-[560px] glass-effect rounded-[2.5rem] p-2.5 flex justify-around shadow-2xl border border-white/10 z-[100]">
-        <NavBtn active={activeTab === "dashboard"} onClick={() => setActiveTab("dashboard")} icon="layout-dashboard" label="Home" />
-        <NavBtn active={activeTab === "inventory"} onClick={() => setActiveTab("inventory")} icon="boxes" label="Bestand" />
-        <NavBtn active={activeTab === "add"} onClick={() => setActiveTab("add")} icon="arrow-down-to-dot" label="Eingang" color="emerald" />
-        <NavBtn active={activeTab === "move"} onClick={() => setActiveTab("move")} icon="shuffle" label="Umlagern" color="blue" />
-        <NavBtn active={activeTab === "outbound"} onClick={() => setActiveTab("outbound")} icon="arrow-up-right-from-circle" label="Ausgang" color="rose" />
+        <NavBtn active={activeTab === "dashboard"} onClick={() => goTab("dashboard")} icon="layout-dashboard" label="Home" />
+        <NavBtn active={activeTab === "inventory"} onClick={() => goTab("inventory")} icon="boxes" label="Bestand" />
+        <NavBtn active={activeTab === "add"} onClick={() => goTab("add")} icon="arrow-down-to-dot" label="Eingang" color="emerald" />
+        <NavBtn active={activeTab === "move"} onClick={() => goTab("move")} icon="shuffle" label="Umlagern" color="blue" />
+        <NavBtn active={activeTab === "outbound"} onClick={() => goTab("outbound")} icon="arrow-up-right-from-circle" label="Ausgang" color="rose" />
       </nav>
     </div>
   );
