@@ -11,18 +11,25 @@ import {
 } from "firebase/firestore";
 import { onAuthStateChanged, signInAnonymously } from "firebase/auth";
 
+import { Html5Qrcode } from "html5-qrcode";
+
 import { auth, db } from "./firebase/client.js";
 import { DEBUG, APP_ID } from "./config/constants.js";
 import { deriveFromPath, safeDocId, slotIdFrom } from "./utils/ids.js";
 import { itemDocRef, slotDocRef } from "./firebase/refs.js";
 import { moveWholeSlot } from "./modules/moveStock.js";
 
+// ✅ NEW: Einlagern OCR + Putaway
+import { ocrLabelFromImageFile } from "./modules/ocrLabel.js";
+import { parseLabelText } from "./modules/parseLabelText.js";
+import { putawayStock } from "./modules/putawayStock.js";
+
 import Icon from "./components/Icon.jsx";
 import StatChip from "./components/StatChip.jsx";
 import NavBtn from "./components/NavBtn.jsx";
 
 /* =========================
-   QR helpers + scanner
+   QR helpers
 ========================= */
 function parsePlace(text) {
   const raw = String(text || "").trim().toUpperCase();
@@ -31,16 +38,16 @@ function parsePlace(text) {
   return { shelf: `C${Number(m[1])}`, level: m[2] ? Number(m[2]) : null };
 }
 
-function findTopOccupiedLevel(slotMap, shelf, levels) {
-  for (const lvl of levels) {
+function findTopOccupiedLevel(slotMap, shelf, levelsTopDown) {
+  for (const lvl of levelsTopDown) {
     const entries = slotMap.get(`${shelf}|${lvl}`) || [];
     if (entries.length) return lvl;
   }
   return null;
 }
 
-function findBottomEmptyLevel(slotMap, shelf, levels) {
-  const bottomUp = [...levels].sort((a, b) => a - b);
+function findBottomEmptyLevel(slotMap, shelf, levelsTopDown) {
+  const bottomUp = [...levelsTopDown].sort((a, b) => a - b);
   for (const lvl of bottomUp) {
     const entries = slotMap.get(`${shelf}|${lvl}`) || [];
     if (!entries.length) return lvl;
@@ -48,64 +55,94 @@ function findBottomEmptyLevel(slotMap, shelf, levels) {
   return null;
 }
 
+/* =========================
+   QRScanner (html5-qrcode npm)
+   - Start nur per Button (iPhone/Browser braucht User Gesture)
+   - Bevorzugt Back Camera
+========================= */
 function QRScanner({ enabled, onResult, onError }) {
-  const [running, setRunning] = useState(false);
-  const [ready, setReady] = useState(false);
-  const regionId = "qr-reader-region";
-
+  const regionIdRef = useRef(`qr-reader-${Math.random().toString(16).slice(2)}`);
   const qrRef = useRef(null);
 
-  useEffect(() => {
-    // Element sicher "ready" setzen
-    const t = setTimeout(() => setReady(true), 50);
-    return () => clearTimeout(t);
-  }, []);
-
-  const start = async () => {
-    try {
-      if (!enabled) return;
-      if (!ready) return;
-
-      // wenn schon läuft -> nix tun
-      if (running) return;
-
-      // Instanz erstellen (oder wiederverwenden)
-      if (!qrRef.current) qrRef.current = new Html5Qrcode(regionId);
-
-      setRunning(true);
-
-      await qrRef.current.start(
-        { facingMode: "environment" },
-        { fps: 10, qrbox: { width: 240, height: 240 } },
-        (decodedText) => onResult(decodedText),
-        () => {}
-      );
-    } catch (e) {
-      console.error("QR start error:", e);
-      setRunning(false);
-      onError?.(e);
-    }
-  };
+  const [running, setRunning] = useState(false);
+  const [lastText, setLastText] = useState("");
 
   const stop = async () => {
     try {
       if (!qrRef.current) return;
       await qrRef.current.stop().catch(() => {});
       await qrRef.current.clear().catch(() => {});
-    } catch (e) {
-      // ignore
     } finally {
       setRunning(false);
     }
   };
 
-  // Wenn enabled false wird (z.B. confirmOpen), Scanner stoppen
+  const start = async () => {
+    try {
+      if (!enabled || running) return;
+
+      if (!qrRef.current) {
+        qrRef.current = new Html5Qrcode(regionIdRef.current);
+      }
+
+      setRunning(true);
+
+      // 1) Erst versuchen: facingMode environment (Back Camera)
+      try {
+        await qrRef.current.start(
+          { facingMode: "environment" },
+          { fps: 10, qrbox: { width: 260, height: 260 } },
+          (decodedText) => {
+            if (!decodedText) return;
+            if (decodedText === lastText) return;
+            setLastText(decodedText);
+            onResult(decodedText);
+          },
+          () => {}
+        );
+        return;
+      } catch (e) {
+        // fallback auf deviceId (wenn facingMode nicht unterstützt)
+        console.warn("facingMode start failed, fallback to deviceId:", e);
+      }
+
+      // 2) Fallback: Kameras holen und “Back/Rear” bevorzugen
+      const cams = await Html5Qrcode.getCameras();
+      if (!cams || cams.length === 0) {
+        alert("❗ Keine Kamera gefunden.");
+        setRunning(false);
+        return;
+      }
+
+      const preferred =
+        cams.find((c) => /back|rear|environment/i.test(c.label)) || cams[0];
+
+      await qrRef.current.start(
+        { deviceId: { exact: preferred.id } },
+        { fps: 10, qrbox: { width: 260, height: 260 } },
+        (decodedText) => {
+          if (!decodedText) return;
+          if (decodedText === lastText) return;
+          setLastText(decodedText);
+          onResult(decodedText);
+        },
+        () => {}
+      );
+    } catch (e) {
+      console.error("QR start error:", e);
+      setRunning(false);
+      onError?.(e);
+      alert("❗ Kamera konnte nicht gestartet werden. (HTTPS + Kamera-Berechtigung prüfen)");
+    }
+  };
+
+  // wenn enabled=false (Confirm offen / moving) => scanner stoppen
   useEffect(() => {
     if (!enabled && running) stop();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [enabled]);
 
-  // Cleanup
+  // cleanup on unmount
   useEffect(() => {
     return () => {
       stop();
@@ -116,11 +153,11 @@ function QRScanner({ enabled, onResult, onError }) {
 
   return (
     <div className="bg-slate-900 rounded-2xl overflow-hidden border border-slate-700">
-      <div id={regionId} className="w-full" />
+      <div id={regionIdRef.current} className="w-full" style={{ minHeight: 320 }} />
 
       <div className="p-3 flex items-center justify-between gap-2">
         <div className="text-[11px] font-bold text-slate-300">
-          {enabled ? (running ? "Scanner aktiv" : "Scanner bereit") : "Scanner pausiert"}
+          {!enabled ? "Scanner pausiert" : running ? "Scanner aktiv" : "Scanner bereit"}
         </div>
 
         {enabled && !running ? (
@@ -143,10 +180,6 @@ function QRScanner({ enabled, onResult, onError }) {
           </button>
         ) : null}
       </div>
-
-      <div className="px-3 pb-3 text-[10px] font-bold text-slate-400">
-        iPhone: Kamera startet zuverlässig nach Klick auf „Scanner starten“.
-      </div>
     </div>
   );
 }
@@ -156,20 +189,13 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [user, setUser] = useState(null);
 
-  // QR MOVE STATES
-  const [qrMode, setQrMode] = useState("source");
-  const [qrSource, setQrSource] = useState({ shelf: null, level: null });
-  const [qrTarget, setQrTarget] = useState({ shelf: null, level: null });
-  const [qrTextFallback, setQrTextFallback] = useState("");
-  const [lastScan, setLastScan] = useState({ value: "", at: 0 });
-
+  // Data
   const [rawItems, setRawItems] = useState([]);
   const [stegItems, setStegItems] = useState([]);
   const [masterItems, setMasterItems] = useState([]);
-
   const [searchQuery, setSearchQuery] = useState("");
 
-  // forms
+  // Forms (legacy)
   const [newStock, setNewStock] = useState({
     itemKey: "",
     shelf: "C1",
@@ -188,8 +214,67 @@ export default function App() {
   const levels = [5, 4, 3, 2, 1];
 
   /* =========================
+     EINLAGERN (NEW: Platz + Barcode + OCR + Manual Suggest)
+========================= */
+  const [inStep, setInStep] = useState("place"); // "place" | "barcode"
+  const [inPlace, setInPlace] = useState(null); // { shelf, level }
+  const [barcodeStegRaw, setBarcodeStegRaw] = useState("");
+
+  const [labelFile, setLabelFile] = useState(null);
+  const [ocrBusy, setOcrBusy] = useState(false);
+  const [ocrProgress, setOcrProgress] = useState(0);
+  const [ocrError, setOcrError] = useState("");
+  const [ocrText, setOcrText] = useState("");
+
+  const [inbound, setInbound] = useState({
+    itemKey: "",
+    lengthMm: "",
+    qty: "",
+    supplier: "",
+    orderNo: "",
+    deliveryDate: new Date().toISOString().slice(0, 10),
+  });
+
+  const [manualStegQuery, setManualStegQuery] = useState("");
+
+  /* =========================
+     QR MOVE (slot only)
+========================= */
+  const [qrSource, setQrSource] = useState({ shelf: null, level: null });
+  const [qrTarget, setQrTarget] = useState({ shelf: null, level: null });
+  const [qrTextFallback, setQrTextFallback] = useState("");
+
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [moving, setMoving] = useState(false);
+  const [lastScan, setLastScan] = useState({ value: "", at: 0 });
+
+  const stepRef = useRef("source"); // "source" | "target"
+  const ignoreUntilRef = useRef(0);
+
+  const resetAll = () => {
+    stepRef.current = "source";
+    setQrSource({ shelf: null, level: null });
+    setQrTarget({ shelf: null, level: null });
+    setQrTextFallback("");
+    setConfirmOpen(false);
+  };
+
+  const resetSource = () => {
+    stepRef.current = "source";
+    setQrSource({ shelf: null, level: null });
+    setQrTarget({ shelf: null, level: null });
+    setConfirmOpen(false);
+  };
+
+  const resetTarget = () => {
+    stepRef.current = "target";
+    setQrTarget({ shelf: null, level: null });
+    setConfirmOpen(false);
+  };
+
+  /* =========================
      Auth init
-  ========================= */
+========================= */
   useEffect(() => {
     const init = async () => {
       try {
@@ -215,7 +300,7 @@ export default function App() {
 
   /* =========================
      Firestore subscriptions
-  ========================= */
+========================= */
   useEffect(() => {
     if (!user) return;
 
@@ -263,7 +348,7 @@ export default function App() {
 
   /* =========================
      Normalize item docs
-  ========================= */
+========================= */
   const itemDocs = useMemo(() => {
     const out = [];
 
@@ -277,7 +362,8 @@ export default function App() {
 
       const shelf = d.shelf ?? d.location?.shelf ?? derived.shelf;
       const level = Number(d.level ?? d.location?.level ?? derived.level);
-      const slotId = d.slotId ?? derived.slotId ?? (shelf && level ? slotIdFrom(shelf, level) : null);
+      const slotId =
+        d.slotId ?? derived.slotId ?? (shelf && level ? slotIdFrom(shelf, level) : null);
 
       const itemKey = d.itemKey ?? d.key ?? d.code ?? d.__id;
       const quantity = Number(d.quantity) || 0;
@@ -303,7 +389,7 @@ export default function App() {
 
   /* =========================
      slotMap + stats
-  ========================= */
+========================= */
   const slotMap = useMemo(() => {
     const m = new Map();
     for (const it of itemDocs) {
@@ -319,11 +405,14 @@ export default function App() {
   }, [itemDocs]);
 
   const occupiedSlots = slotMap.size;
-  const totalParts = useMemo(() => itemDocs.reduce((s, x) => s + (Number(x.quantity) || 0), 0), [itemDocs]);
+  const totalParts = useMemo(
+    () => itemDocs.reduce((s, x) => s + (Number(x.quantity) || 0), 0),
+    [itemDocs]
+  );
 
   /* =========================
      AWB index
-  ========================= */
+========================= */
   const awbIndex = useMemo(() => {
     const m = new Map();
     for (const it of masterItems) {
@@ -346,7 +435,7 @@ export default function App() {
 
   /* =========================
      grouped + filtered slots
-  ========================= */
+========================= */
   const groupedSlots = useMemo(() => {
     const rows = Array.from(slotMap.entries()).map(([key, entries]) => {
       const [shelf, levelStr] = key.split("|");
@@ -370,7 +459,9 @@ export default function App() {
         const shelfMatch = String(slot.shelf).toUpperCase().includes(term);
         const matched = slot.entries.filter((e) => {
           const keyMatch = String(e.itemKey).toUpperCase().includes(term);
-          const awbMatch = getLinkedAWBs(e.itemKey).some((a) => String(a).toUpperCase().includes(term));
+          const awbMatch = getLinkedAWBs(e.itemKey).some((a) =>
+            String(a).toUpperCase().includes(term)
+          );
           const lvlMatch = `L${slot.level}`.includes(term);
           return keyMatch || awbMatch || shelfMatch || lvlMatch;
         });
@@ -383,8 +474,8 @@ export default function App() {
   }, [groupedSlots, searchQuery, awbIndex]);
 
   /* =========================
-     Add / Remove
-  ========================= */
+     Add / Remove (legacy add kept)
+========================= */
   const handleAddStock = async (e) => {
     e.preventDefault();
     const qty = Number(newStock.qty);
@@ -398,7 +489,11 @@ export default function App() {
     const iRef = itemDocRef(slotId, itemKey);
 
     try {
-      await setDoc(sRef, { appId: APP_ID, slotId, shelf, level, updatedAt: Date.now() }, { merge: true });
+      await setDoc(
+        sRef,
+        { appId: APP_ID, slotId, shelf, level, updatedAt: Date.now() },
+        { merge: true }
+      );
 
       const snap = await getDoc(iRef);
       if (snap.exists()) {
@@ -471,7 +566,12 @@ export default function App() {
     try {
       const newQty = selected.quantity - qty;
       if (newQty <= 0) await deleteDoc(iRef);
-      else await updateDoc(iRef, { quantity: newQty, updatedAt: Date.now(), lastDestination: outStock.destination });
+      else
+        await updateDoc(iRef, {
+          quantity: newQty,
+          updatedAt: Date.now(),
+          lastDestination: outStock.destination,
+        });
 
       setOutStock({ entryId: "", qty: "", destination: "produktion" });
       setActiveTab("inventory");
@@ -481,52 +581,243 @@ export default function App() {
   };
 
   /* =========================
-     QR MOVE LOGIC (slot only)
-  ========================= */
+     EINLAGERN logic (NEW)
+========================= */
+  const onScanPlaceForInbound = (decodedText) => {
+    const p = parsePlace(decodedText);
+    if (!p) {
+      alert("❗ Platz ungültig. Erwartet z.B. C1 oder C1-L3");
+      return;
+    }
+    setInPlace(p);
+    setInStep("barcode");
+    try {
+      navigator.vibrate?.(30);
+    } catch {}
+  };
+
+  const onScanBarcodeForInbound = (decodedText) => {
+    const raw = String(decodedText || "").trim();
+    if (!raw) return;
+
+    // Standard: StegNr ist numerisch -> wir ziehen Ziffern
+    const digits = raw.replace(/\D/g, "");
+    const key = digits || raw;
+
+    setBarcodeStegRaw(raw);
+    setInbound((x) => ({ ...x, itemKey: key }));
+    try {
+      navigator.vibrate?.([30, 30]);
+    } catch {}
+  };
+
+  const runOcr = async (file) => {
+    try {
+      setOcrError("");
+      setOcrText("");
+      setOcrBusy(true);
+      setOcrProgress(0);
+
+      const text = await ocrLabelFromImageFile(file, setOcrProgress);
+      setOcrText(text);
+
+      const p = parseLabelText(text);
+      setInbound((x) => ({
+        ...x,
+        // StegNr nur setzen, wenn leer (Barcode/Manual hat Priorität)
+        itemKey: x.itemKey ? x.itemKey : (p.itemKey || ""),
+        lengthMm: p.lengthMm ?? x.lengthMm,
+        qty: p.qty ?? x.qty,
+        supplier: p.supplier ?? x.supplier,
+        orderNo: p.orderNo ?? x.orderNo,
+        deliveryDate: p.deliveryDate ?? x.deliveryDate,
+      }));
+    } catch (e) {
+      console.error(e);
+      setOcrError(e?.message || "OCR Fehler");
+    } finally {
+      setOcrBusy(false);
+    }
+  };
+
+  const doInboundPutaway = async () => {
+    try {
+      if (!inPlace?.shelf) return alert("Bitte zuerst Platz scannen.");
+
+      const itemKey = String(inbound.itemKey || "").trim();
+      const qty = Number(inbound.qty);
+      const lengthMm = Number(inbound.lengthMm);
+
+      if (!itemKey) return alert("Steg-Nr fehlt (Barcode oder manuell).");
+      if (!qty || qty <= 0) return alert("Menge fehlt/ungültig.");
+      if (!lengthMm || lengthMm <= 0) return alert("Länge fehlt/ungültig.");
+
+      const res = await putawayStock({
+        APP_ID,
+        slotDocRef,
+        itemDocRef,
+        slotMap,
+        shelves,
+        levels,
+        itemKey,
+        qty,
+        preferredShelf: inPlace.shelf,
+        preferredLevel: inPlace.level ?? null,
+        source: "anlieferung",
+        meta: {
+          lengthMm,
+          supplier: inbound.supplier || null,
+          orderNo: inbound.orderNo || null,
+          deliveryDate: inbound.deliveryDate || null,
+        },
+      });
+
+      alert(`✅ Eingelagert in ${res.shelf}-L${res.level}`);
+
+      // Reset
+      setInStep("place");
+      setInPlace(null);
+      setBarcodeStegRaw("");
+      setLabelFile(null);
+      setOcrText("");
+      setOcrProgress(0);
+      setOcrBusy(false);
+      setOcrError("");
+      setManualStegQuery("");
+      setInbound({
+        itemKey: "",
+        lengthMm: "",
+        qty: "",
+        supplier: "",
+        orderNo: "",
+        deliveryDate: new Date().toISOString().slice(0, 10),
+      });
+
+      setActiveTab("inventory");
+    } catch (e) {
+      console.error(e);
+      alert(`❗ Fehler: ${e?.message || "Konsole prüfen"}`);
+    }
+  };
+
+  const stegCandidates = useMemo(() => {
+    const q = String(manualStegQuery || "").trim().replace(/\D/g, "");
+    if (!q) return [];
+    return stegItems
+      .map((s) => String(s.code || s.id || ""))
+      .filter(Boolean)
+      .filter((code) => code.startsWith(q))
+      .slice(0, 8);
+  }, [manualStegQuery, stegItems]);
+
+  const suggestedSteg = stegCandidates[0] || "";
+
+  const reqMissing = {
+    place: !inPlace?.shelf,
+    itemKey: !String(inbound.itemKey || "").trim(),
+    qty: !(Number(inbound.qty) > 0),
+    lengthMm: !(Number(inbound.lengthMm) > 0),
+  };
+
+  const canPutaway =
+    !ocrBusy &&
+    !reqMissing.place &&
+    !reqMissing.itemKey &&
+    !reqMissing.qty &&
+    !reqMissing.lengthMm;
+
+  /* =========================
+     QR APPLY SCAN (MOVE)
+========================= */
   const applyScan = (raw) => {
+    if (moving || confirmOpen) return;
+
     const now = Date.now();
+
+    // Global ignore window (already used)
+    if (now < ignoreUntilRef.current) return;
+
     const val = String(raw || "").trim();
     if (!val) return;
 
-    if (val === lastScan.value && now - lastScan.at < 1200) return;
+    // Anti-spam: same text too fast
+    if (val === lastScan.value && now - lastScan.at < 900) return;
     setLastScan({ value: val, at: now });
 
     const parsed = parsePlace(val);
-    if (!parsed) return alert("❗ QR ungültig. Erwartet z.B. C1 oder C1-L5");
+    if (!parsed) {
+      alert("❗ QR ungültig. Erwartet z.B. C8 oder C8-L3");
+      return;
+    }
 
-    if (qrMode === "source") {
+    const step = stepRef.current;
+
+    // ===== SETTINGS =====
+    const cooldownAfterSourceMs = 1200; // <- wichtig gegen doppelscan
+    const sourceSetAtRef =
+      applyScan.sourceSetAtRef || (applyScan.sourceSetAtRef = { t: 0 });
+    const sourceShelfRef =
+      applyScan.sourceShelfRef || (applyScan.sourceShelfRef = { shelf: null });
+
+    if (step === "source") {
       const lvl = parsed.level ?? findTopOccupiedLevel(slotMap, parsed.shelf, levels);
-      if (!lvl) return alert(`ℹ️ ${parsed.shelf} hat keinen Bestand.`);
+      if (!lvl) {
+        alert(`ℹ️ ${parsed.shelf} hat keinen Bestand.`);
+        return;
+      }
+
+      // set source
       setQrSource({ shelf: parsed.shelf, level: lvl });
-      setQrMode("target");
+
+      // switch immediately to target
+      stepRef.current = "target";
+
+      // remember source shelf + time
+      sourceShelfRef.shelf = parsed.shelf;
+      sourceSetAtRef.t = Date.now();
+
+      // HARD freeze for short time -> ignores the "next frames"
+      ignoreUntilRef.current = Date.now() + cooldownAfterSourceMs;
+
+      try {
+        navigator.vibrate?.(30);
+      } catch {}
+      return;
+    }
+
+    // ===== TARGET =====
+
+    // 1) Too fast after source? ignore (extra safety besides ignoreUntilRef)
+    if (now - sourceSetAtRef.t < cooldownAfterSourceMs) {
+      return; // still cooling down
+    }
+
+    // 2) Optional but recommended: target must be DIFFERENT shelf than source
+    if (sourceShelfRef.shelf && parsed.shelf === sourceShelfRef.shelf) {
+      alert(`ℹ️ Ziel muss ein anderes Regal sein als die Quelle (${sourceShelfRef.shelf}).`);
+      ignoreUntilRef.current = Date.now() + 800;
       return;
     }
 
     const lvl = parsed.level ?? findBottomEmptyLevel(slotMap, parsed.shelf, levels);
-    if (!lvl) return alert(`❗ ${parsed.shelf} ist voll.`);
+    if (!lvl) {
+      alert(`❗ ${parsed.shelf} ist voll.`);
+      ignoreUntilRef.current = Date.now() + 800;
+      return;
+    }
+
     setQrTarget({ shelf: parsed.shelf, level: lvl });
+    setConfirmOpen(true);
+
+    try {
+      navigator.vibrate?.([30, 30, 30]);
+    } catch {}
   };
 
-  const resetSource = () => {
-    setQrMode("source");
-    setQrSource({ shelf: null, level: null });
-  };
-
-  const resetTarget = () => {
-    setQrTarget({ shelf: null, level: null });
-  };
-
-  const handleMoveByQR = async () => {
+  const doMove = async () => {
     if (!qrSource.shelf || !qrTarget.shelf) return;
 
-    const ok = confirm(
-      `Slot umlagern?\n\n` +
-        `Quelle: ${qrSource.shelf}-L${qrSource.level} (oberste belegte Ebene)\n` +
-        `Ziel:   ${qrTarget.shelf}-L${qrTarget.level} (unterste freie Ebene)\n\n` +
-        `Alle Stege werden verschoben.`
-    );
-    if (!ok) return;
-
+    setMoving(true);
     try {
       const res = await moveWholeSlot({
         db,
@@ -540,32 +831,36 @@ export default function App() {
       });
 
       alert(`✅ Umlagerung fertig.\nSorten verschoben: ${res.movedTypes}`);
-
-      setQrSource({ shelf: null, level: null });
-      setQrTarget({ shelf: null, level: null });
-      setQrMode("source");
-      setQrTextFallback("");
+      resetAll();
       setActiveTab("inventory");
     } catch (e) {
       console.error(e);
       alert(`❗ Fehler: ${e?.message || "Konsole prüfen"}`);
+      setConfirmOpen(false);
+    } finally {
+      setMoving(false);
+      ignoreUntilRef.current = Date.now() + 800;
     }
   };
 
+  const scannerEnabled = activeTab === "move" && !confirmOpen && !moving;
+
   /* =========================
-     Loading screen
-  ========================= */
-  if (loading)
+     Loading
+========================= */
+  if (loading) {
     return (
       <div className="h-screen flex flex-col items-center justify-center bg-slate-900 text-yellow-500">
         <div className="w-16 h-16 border-4 border-yellow-500 border-t-transparent rounded-full animate-spin mb-6"></div>
-        <p className="font-black italic uppercase tracking-widest">System wird initialisiert...</p>
+        <p className="font-black italic uppercase tracking-widest">
+          System wird initialisiert...
+        </p>
       </div>
     );
+  }
 
   return (
     <div className="max-w-4xl mx-auto min-h-screen pb-36 relative">
-      {/* DEBUG overlay */}
       {DEBUG && (
         <div className="fixed top-3 right-3 z-[999] bg-white/90 backdrop-blur border border-slate-200 shadow-lg rounded-2xl px-4 py-3 text-[11px] font-bold text-slate-700">
           <div>
@@ -605,16 +900,28 @@ export default function App() {
           <div className="space-y-6">
             <div className="grid grid-cols-3 gap-3">
               <div className="bg-white p-4 rounded-3xl shadow-sm border border-slate-200">
-                <p className="text-[9px] font-black text-slate-400 uppercase mb-1">Stege DB</p>
-                <p className="text-2xl font-black text-slate-800 leading-none">{stegItems.length}</p>
+                <p className="text-[9px] font-black text-slate-400 uppercase mb-1">
+                  Stege DB
+                </p>
+                <p className="text-2xl font-black text-slate-800 leading-none">
+                  {stegItems.length}
+                </p>
               </div>
               <div className="bg-white p-4 rounded-3xl shadow-sm border border-slate-200">
-                <p className="text-[9px] font-black text-slate-400 uppercase mb-1">Teile Gesamt</p>
-                <p className="text-2xl font-black text-yellow-600 leading-none">{totalParts}</p>
+                <p className="text-[9px] font-black text-slate-400 uppercase mb-1">
+                  Teile Gesamt
+                </p>
+                <p className="text-2xl font-black text-yellow-600 leading-none">
+                  {totalParts}
+                </p>
               </div>
               <div className="bg-white p-4 rounded-3xl shadow-sm border border-slate-200">
-                <p className="text-[9px] font-black text-slate-400 uppercase mb-1">Belegte Plätze</p>
-                <p className="text-2xl font-black text-slate-800 leading-none">{occupiedSlots}/190</p>
+                <p className="text-[9px] font-black text-slate-400 uppercase mb-1">
+                  Belegte Plätze
+                </p>
+                <p className="text-2xl font-black text-slate-800 leading-none">
+                  {occupiedSlots}/190
+                </p>
               </div>
             </div>
 
@@ -623,7 +930,9 @@ export default function App() {
                 <h3 className="text-xs font-black uppercase text-yellow-500 tracking-widest flex items-center gap-2">
                   <Icon name="grid" size={16} /> Aktuelle Belegung
                 </h3>
-                <span className="text-[10px] text-slate-500 font-bold">Gestell C1 - C38</span>
+                <span className="text-[10px] text-slate-500 font-bold">
+                  Gestell C1 - C38
+                </span>
               </div>
 
               <div className="overflow-x-auto custom-scrollbar pb-4">
@@ -642,14 +951,16 @@ export default function App() {
                               setSearchQuery(`${s}`);
                               setActiveTab("inventory");
                             }}
-                            className={`w-7 h-7 rounded-lg grid-cell shadow-inner flex items-center justify-center ${
+                            className={`w-7 h-7 rounded-lg shadow-inner flex items-center justify-center ${
                               count
                                 ? "bg-yellow-500 shadow-yellow-500/20 cursor-pointer"
-                                : "bg-slate-800 opacity-20 cursor-default"
+                                : "bg-slate-800 opacity-20"
                             }`}
                             title={`${s} - L${l}`}
                           >
-                            {count ? <span className="text-[11px] font-black text-slate-900">{count}</span> : null}
+                            {count ? (
+                              <span className="text-[11px] font-black text-slate-900">{count}</span>
+                            ) : null}
                           </div>
                         );
                       })}
@@ -757,106 +1068,230 @@ export default function App() {
           </div>
         )}
 
-        {/* ADD */}
+        {/* ADD (REPLACED) */}
         {activeTab === "add" && (
-          <div className="bg-white p-8 rounded-[2.5rem] shadow-xl border border-slate-200 space-y-6">
-            <div className="flex items-center gap-3">
-              <div className="p-2 bg-emerald-100 text-emerald-600 rounded-xl">
-                <Icon name="arrow-down-to-dot" />
-              </div>
-              <h3 className="font-black uppercase text-slate-800 italic text-xl">Wareneingang</h3>
-            </div>
-
-            <form onSubmit={handleAddStock} className="space-y-5">
-              <div className="flex gap-2 p-1 bg-slate-100 rounded-2xl">
-                <button
-                  type="button"
-                  onClick={() => setNewStock({ ...newStock, source: "anlieferung" })}
-                  className={`flex-1 py-3 rounded-xl text-[10px] font-black uppercase transition-all ${
-                    newStock.source === "anlieferung" ? "bg-white shadow-sm text-emerald-600" : "text-slate-400"
-                  }`}
-                >
-                  Anlieferung
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setNewStock({ ...newStock, source: "produktion" })}
-                  className={`flex-1 py-3 rounded-xl text-[10px] font-black uppercase transition-all ${
-                    newStock.source === "produktion" ? "bg-white shadow-sm text-blue-600" : "text-slate-400"
-                  }`}
-                >
-                  Rücklauf
-                </button>
-              </div>
-
-              <div className="space-y-1">
-                <label className="text-[10px] font-black uppercase text-slate-400 ml-4">Steg auswählen</label>
-                <select
-                  required
-                  value={newStock.itemKey}
-                  onChange={(e) => setNewStock({ ...newStock, itemKey: e.target.value })}
-                  className="w-full p-4 bg-slate-50 rounded-2xl font-bold border-2 border-slate-100 appearance-none outline-none focus:border-emerald-400"
-                >
-                  <option value="">-- Typ wählen --</option>
-                  {stegItems.map((s) => (
-                    <option key={s.id} value={s.code}>
-                      {s.code}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-1">
-                  <label className="text-[10px] font-black uppercase text-slate-400 ml-4">Regal (C)</label>
-                  <select
-                    value={newStock.shelf}
-                    onChange={(e) => setNewStock({ ...newStock, shelf: e.target.value })}
-                    className="w-full p-4 bg-slate-50 rounded-2xl font-bold border-2 border-slate-100 outline-none"
-                  >
-                    {shelves.map((s) => (
-                      <option key={s} value={s}>
-                        {s}
-                      </option>
-                    ))}
-                  </select>
+          <div className="space-y-4">
+            <div className="bg-white p-7 rounded-[2.5rem] shadow-xl border border-slate-200 space-y-5">
+              <div className="flex items-center gap-3">
+                <div className="p-2 bg-emerald-100 text-emerald-600 rounded-xl">
+                  <Icon name="arrow-down-to-dot" />
                 </div>
-                <div className="space-y-1">
-                  <label className="text-[10px] font-black uppercase text-slate-400 ml-4">Ebene</label>
-                  <select
-                    value={newStock.level}
-                    onChange={(e) => setNewStock({ ...newStock, level: Number(e.target.value) })}
-                    className="w-full p-4 bg-slate-50 rounded-2xl font-bold border-2 border-slate-100 outline-none"
-                  >
-                    {levels.map((l) => (
-                      <option key={l} value={l}>
-                        Ebene {l}
-                      </option>
-                    ))}
-                  </select>
+                <div className="min-w-0">
+                  <h3 className="font-black uppercase text-slate-800 italic text-xl leading-tight">
+                    Einlagern
+                  </h3>
+                  <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+                    Platz scannen → Barcode (Steg Nr) → Etikett Foto (OCR) → Bestätigen
+                  </p>
                 </div>
               </div>
 
-              <div className="space-y-1">
-                <label className="text-[10px] font-black uppercase text-slate-400 ml-4">Stückzahl</label>
-                <input
-                  required
-                  type="number"
-                  min="1"
-                  placeholder="Menge..."
-                  value={newStock.qty}
-                  onChange={(e) => setNewStock({ ...newStock, qty: e.target.value })}
-                  className="w-full p-4 bg-slate-50 rounded-2xl font-bold border-2 border-slate-100 outline-none focus:border-emerald-400"
+              <div className="flex gap-2 flex-wrap">
+                <StatChip
+                  label="Schritt"
+                  value={inStep === "place" ? "Platz scannen" : "Barcode scannen"}
+                  tone="emerald"
+                />
+                <StatChip
+                  label="Platz"
+                  value={
+                    inPlace?.shelf ? `${inPlace.shelf}${inPlace.level ? `-L${inPlace.level}` : ""}` : "—"
+                  }
+                  tone={inPlace?.shelf ? "emerald" : "slate"}
+                />
+                <StatChip
+                  label="Steg"
+                  value={inbound.itemKey ? inbound.itemKey : "—"}
+                  tone={inbound.itemKey ? "emerald" : "slate"}
                 />
               </div>
 
-              <button
-                type="submit"
-                className="w-full py-5 bg-emerald-600 text-white rounded-[1.5rem] font-black uppercase shadow-lg shadow-emerald-600/20 active:scale-95 transition-all sticky bottom-4"
-              >
-                Einlagern bestätigen
-              </button>
-            </form>
+              <QRScanner
+                enabled={true}
+                onResult={(txt) => {
+                  if (inStep === "place") onScanPlaceForInbound(txt);
+                  else onScanBarcodeForInbound(txt);
+                }}
+                onError={() => {}}
+              />
+
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setInStep("place");
+                    setInPlace(null);
+                  }}
+                  className="flex-1 py-3 bg-slate-100 rounded-xl font-black text-[11px] text-slate-700"
+                >
+                  Platz zurücksetzen
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setInbound((x) => ({ ...x, itemKey: "" }));
+                    setBarcodeStegRaw("");
+                    setInStep("barcode");
+                  }}
+                  className="flex-1 py-3 bg-slate-100 rounded-xl font-black text-[11px] text-slate-700"
+                >
+                  Steg zurücksetzen
+                </button>
+              </div>
+
+              {/* Barcode info */}
+              <div className="text-[10px] font-bold text-slate-500">
+                Barcode gelesen: <span className="text-slate-900">{barcodeStegRaw || "—"}</span>
+              </div>
+
+              {/* OCR Upload (AUTO) */}
+              <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-3">
+                <div className="text-[10px] font-black uppercase text-slate-400">
+                  Etikett Foto (OCR)
+                </div>
+
+                <input
+                  type="file"
+                  accept="image/*"
+                  onChange={(e) => {
+                    const f = e.target.files?.[0] || null;
+                    setLabelFile(f);
+                    if (f) runOcr(f);
+                  }}
+                  className="w-full"
+                />
+
+                {ocrBusy ? (
+                  <div className="text-xs font-bold text-slate-600">OCR läuft… {ocrProgress}%</div>
+                ) : null}
+
+                {ocrError ? <div className="text-xs font-black text-red-600">{ocrError}</div> : null}
+
+                {ocrText ? (
+                  <details className="text-xs">
+                    <summary className="font-black cursor-pointer">OCR-Text anzeigen</summary>
+                    <pre className="whitespace-pre-wrap mt-2 p-3 rounded-xl bg-white border">
+                      {ocrText}
+                    </pre>
+                  </details>
+                ) : null}
+              </div>
+
+              {/* DATA FORM */}
+              <div className="bg-white border border-slate-200 rounded-2xl p-4 space-y-2">
+                <div className="text-[10px] font-black uppercase text-slate-400">Daten prüfen</div>
+
+                {!inPlace?.shelf ? (
+                  <div className="text-xs font-black text-red-600">Bitte zuerst Platz scannen.</div>
+                ) : null}
+
+                <input
+                  value={inbound.itemKey}
+                  onChange={(e) => setInbound((x) => ({ ...x, itemKey: e.target.value }))}
+                  placeholder="Steg Nr (Barcode oder manuell)"
+                  className={`w-full p-3 rounded-2xl border-2 font-bold outline-none ${
+                    reqMissing.itemKey ? "border-red-400 bg-red-50" : "border-slate-100 bg-white"
+                  }`}
+                />
+
+                <input
+                  value={inbound.lengthMm}
+                  onChange={(e) => setInbound((x) => ({ ...x, lengthMm: e.target.value }))}
+                  placeholder="Länge (mm)"
+                  className={`w-full p-3 rounded-2xl border-2 font-bold outline-none ${
+                    reqMissing.lengthMm ? "border-red-400 bg-red-50" : "border-slate-100 bg-white"
+                  }`}
+                />
+
+                <input
+                  value={inbound.qty}
+                  onChange={(e) => setInbound((x) => ({ ...x, qty: e.target.value }))}
+                  placeholder="Menge"
+                  className={`w-full p-3 rounded-2xl border-2 font-bold outline-none ${
+                    reqMissing.qty ? "border-red-400 bg-red-50" : "border-slate-100 bg-white"
+                  }`}
+                />
+
+                <input
+                  value={inbound.supplier}
+                  onChange={(e) => setInbound((x) => ({ ...x, supplier: e.target.value }))}
+                  placeholder="Lieferant"
+                  className="w-full p-3 rounded-2xl border-2 border-slate-100 font-bold outline-none"
+                />
+
+                <input
+                  value={inbound.orderNo}
+                  onChange={(e) => setInbound((x) => ({ ...x, orderNo: e.target.value }))}
+                  placeholder="Bestellung"
+                  className="w-full p-3 rounded-2xl border-2 border-slate-100 font-bold outline-none"
+                />
+
+                <input
+                  type="date"
+                  value={inbound.deliveryDate}
+                  onChange={(e) => setInbound((x) => ({ ...x, deliveryDate: e.target.value }))}
+                  className="w-full p-3 rounded-2xl border-2 border-slate-100 font-bold outline-none"
+                />
+
+                <button
+                  type="button"
+                  onClick={doInboundPutaway}
+                  disabled={!canPutaway}
+                  className={`w-full py-4 rounded-[1.2rem] font-black uppercase text-white shadow-lg active:scale-95 transition-all ${
+                    canPutaway
+                      ? "bg-emerald-600 shadow-emerald-600/20"
+                      : "bg-slate-300 shadow-none cursor-not-allowed"
+                  }`}
+                >
+                  {ocrBusy ? `OCR läuft… (${ocrProgress}%)` : "Einlagern bestätigen"}
+                </button>
+
+                <div className="text-[10px] text-slate-500 font-bold text-center">
+                  Wenn du nur <b>C1</b> scannst: Einlagerung in die <b>unterste freie Ebene</b> von C1.
+                </div>
+              </div>
+
+              {/* MANUAL STEG PICKER (BOTTOM) */}
+              <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-3">
+                <div className="text-[10px] font-black uppercase text-slate-400">
+                  Manuell Steg auswählen (Dropdown / Vorschlag)
+                </div>
+
+                <input
+                  value={manualStegQuery}
+                  onChange={(e) => setManualStegQuery(e.target.value)}
+                  placeholder="erste Zahlen tippen… z.B. 284"
+                  className="w-full p-3 bg-white rounded-xl font-bold border-2 border-slate-100 outline-none"
+                />
+
+                {suggestedSteg ? (
+                  <button
+                    type="button"
+                    onClick={() => setInbound((x) => ({ ...x, itemKey: suggestedSteg }))}
+                    className="w-full px-4 py-3 rounded-xl bg-white border border-slate-200 font-black text-left"
+                  >
+                    Vorschlag: <span className="text-emerald-700">{suggestedSteg}</span> (antippen)
+                  </button>
+                ) : (
+                  <div className="text-xs font-bold text-slate-500">Kein Vorschlag</div>
+                )}
+
+                {stegCandidates.length > 1 ? (
+                  <div className="grid grid-cols-2 gap-2">
+                    {stegCandidates.slice(1).map((k) => (
+                      <button
+                        key={k}
+                        type="button"
+                        onClick={() => setInbound((x) => ({ ...x, itemKey: k }))}
+                        className="px-3 py-2 rounded-xl bg-white border border-slate-200 font-bold text-sm"
+                      >
+                        {k}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            </div>
           </div>
         )}
 
@@ -869,15 +1304,21 @@ export default function App() {
                   <Icon name="qr-code" />
                 </div>
                 <div className="min-w-0">
-                  <h3 className="font-black uppercase text-slate-800 italic text-xl leading-tight">Umlagern (QR)</h3>
+                  <h3 className="font-black uppercase text-slate-800 italic text-xl leading-tight">
+                    Umlagern (QR)
+                  </h3>
                   <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
-                    Quelle scannen → Ziel scannen → Slot umlagern
+                    Quelle scannen → Ziel scannen → Bestätigen
                   </p>
                 </div>
               </div>
 
               <div className="flex gap-2 flex-wrap">
-                <StatChip label="Modus" value={qrMode === "source" ? "Quelle scannen" : "Ziel scannen"} tone="blue" />
+                <StatChip
+                  label="Modus"
+                  value={stepRef.current === "source" ? "Quelle scannen" : "Ziel scannen"}
+                  tone="blue"
+                />
                 <StatChip
                   label="Quelle"
                   value={qrSource.shelf ? `${qrSource.shelf}-L${qrSource.level}` : "—"}
@@ -890,42 +1331,51 @@ export default function App() {
                 />
               </div>
 
-              <QRScanner onResult={applyScan} onError={() => {}} />
+              {confirmOpen && qrSource.shelf && qrTarget.shelf ? (
+                <div className="bg-blue-50 border border-blue-200 rounded-[1.5rem] p-4">
+                  <div className="text-[10px] font-black uppercase text-blue-700 tracking-widest mb-2">
+                    Umlagerung bestätigen
+                  </div>
 
-              <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-2">
-                <div className="text-[10px] font-black uppercase text-slate-400">Fallback</div>
-                <div className="flex gap-2">
-                  <input
-                    value={qrTextFallback}
-                    onChange={(e) => setQrTextFallback(e.target.value)}
-                    placeholder="z.B. C1 oder C2"
-                    className="flex-1 p-3 bg-white rounded-xl font-bold border-2 border-slate-100 outline-none"
-                  />
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="bg-white border border-slate-200 rounded-2xl p-3">
+                      <div className="text-[10px] font-black uppercase text-slate-400">Quelle</div>
+                      <div className="font-black text-slate-900 text-lg">
+                        {qrSource.shelf}-L{qrSource.level}
+                      </div>
+                    </div>
+
+                    <div className="bg-white border border-slate-200 rounded-2xl p-3">
+                      <div className="text-[10px] font-black uppercase text-slate-400">Ziel</div>
+                      <div className="font-black text-slate-900 text-lg">
+                        {qrTarget.shelf}-L{qrTarget.level}
+                      </div>
+                    </div>
+                  </div>
+
                   <button
                     type="button"
-                    onClick={() => applyScan(qrTextFallback)}
-                    className="px-4 py-3 bg-slate-900 text-yellow-500 rounded-xl font-black"
+                    onClick={async () => {
+                      setConfirmOpen(false);
+                      await doMove();
+                    }}
+                    disabled={moving}
+                    className={`w-full mt-4 py-4 text-white rounded-[1.2rem] font-black uppercase shadow-lg active:scale-95 transition-all ${
+                      moving
+                        ? "bg-slate-400 shadow-none cursor-not-allowed"
+                        : "bg-blue-700 shadow-blue-700/20"
+                    }`}
                   >
-                    Anwenden
+                    {moving ? "Umlagern..." : "Bestätigen"}
                   </button>
-                </div>
-                <div className="text-[10px] text-slate-500 font-bold">
-                  Quelle: oberste belegte Ebene • Ziel: unterste freie Ebene
-                </div>
-              </div>
 
-              <button
-                type="button"
-                onClick={handleMoveByQR}
-                disabled={!qrSource.shelf || !qrTarget.shelf}
-                className={`w-full py-5 text-white rounded-[1.5rem] font-black uppercase shadow-lg active:scale-95 transition-all sticky bottom-4 ${
-                  !qrSource.shelf || !qrTarget.shelf
-                    ? "bg-slate-300 shadow-none cursor-not-allowed"
-                    : "bg-blue-700 shadow-blue-700/20"
-                }`}
-              >
-                Slot umlagern
-              </button>
+                  <div className="mt-2 text-[10px] text-blue-700/80 font-bold text-center">
+                    Scanner ist pausiert bis zur Bestätigung.
+                  </div>
+                </div>
+              ) : null}
+
+              <QRScanner enabled={scannerEnabled} onResult={applyScan} onError={() => {}} />
 
               <div className="flex gap-2">
                 <button
@@ -943,6 +1393,36 @@ export default function App() {
                   Ziel zurücksetzen
                 </button>
               </div>
+
+              <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-3">
+                <div className="text-[10px] font-black uppercase text-slate-400">Fallback</div>
+
+                <input
+                  value={qrTextFallback}
+                  onChange={(e) => setQrTextFallback(e.target.value)}
+                  placeholder="z.B. C8 oder C8-L3"
+                  className="w-full p-3 bg-white rounded-xl font-bold border-2 border-slate-100 outline-none"
+                />
+
+                <div className="flex justify-center">
+                  <button
+                    type="button"
+                    onClick={() => applyScan(qrTextFallback)}
+                    disabled={moving || confirmOpen}
+                    className={`px-10 py-3 rounded-xl font-black active:scale-95 transition-all ${
+                      moving || confirmOpen
+                        ? "bg-slate-300 text-white cursor-not-allowed"
+                        : "bg-slate-900 text-yellow-500"
+                    }`}
+                  >
+                    Anwenden
+                  </button>
+                </div>
+
+                <div className="text-[10px] text-slate-500 font-bold text-center">
+                  Quelle: oberste belegte Ebene • Ziel: unterste freie Ebene
+                </div>
+              </div>
             </div>
           </div>
         )}
@@ -959,7 +1439,9 @@ export default function App() {
 
             <form onSubmit={handleRemoveStock} className="space-y-5">
               <div className="space-y-1">
-                <label className="text-[10px] font-black uppercase text-slate-400 ml-4">Eintrag wählen</label>
+                <label className="text-[10px] font-black uppercase text-slate-400 ml-4">
+                  Eintrag wählen
+                </label>
                 <select
                   required
                   value={outStock.entryId}
@@ -976,7 +1458,9 @@ export default function App() {
               </div>
 
               <div className="space-y-1">
-                <label className="text-[10px] font-black uppercase text-slate-400 ml-4">Verwendung</label>
+                <label className="text-[10px] font-black uppercase text-slate-400 ml-4">
+                  Verwendung
+                </label>
                 <select
                   value={outStock.destination}
                   onChange={(e) => setOutStock({ ...outStock, destination: e.target.value })}
@@ -989,7 +1473,9 @@ export default function App() {
               </div>
 
               <div className="space-y-1">
-                <label className="text-[10px] font-black uppercase text-slate-400 ml-4">Entnahmemenge</label>
+                <label className="text-[10px] font-black uppercase text-slate-400 ml-4">
+                  Entnahmemenge
+                </label>
                 <input
                   required
                   type="number"
@@ -1013,11 +1499,39 @@ export default function App() {
       </main>
 
       <nav className="fixed bottom-5 left-1/2 -translate-x-1/2 w-[94%] max-w-[560px] glass-effect rounded-[2.5rem] p-2.5 flex justify-around shadow-2xl border border-white/10 z-[100]">
-        <NavBtn active={activeTab === "dashboard"} onClick={() => setActiveTab("dashboard")} icon="layout-dashboard" label="Home" />
-        <NavBtn active={activeTab === "inventory"} onClick={() => setActiveTab("inventory")} icon="boxes" label="Bestand" />
-        <NavBtn active={activeTab === "add"} onClick={() => setActiveTab("add")} icon="arrow-down-to-dot" label="Eingang" color="emerald" />
-        <NavBtn active={activeTab === "move"} onClick={() => setActiveTab("move")} icon="shuffle" label="Umlagern" color="blue" />
-        <NavBtn active={activeTab === "outbound"} onClick={() => setActiveTab("outbound")} icon="arrow-up-right-from-circle" label="Ausgang" color="rose" />
+        <NavBtn
+          active={activeTab === "dashboard"}
+          onClick={() => setActiveTab("dashboard")}
+          icon="layout-dashboard"
+          label="Home"
+        />
+        <NavBtn
+          active={activeTab === "inventory"}
+          onClick={() => setActiveTab("inventory")}
+          icon="boxes"
+          label="Bestand"
+        />
+        <NavBtn
+          active={activeTab === "add"}
+          onClick={() => setActiveTab("add")}
+          icon="arrow-down-to-dot"
+          label="Eingang"
+          color="emerald"
+        />
+        <NavBtn
+          active={activeTab === "move"}
+          onClick={() => setActiveTab("move")}
+          icon="shuffle"
+          label="Umlagern"
+          color="blue"
+        />
+        <NavBtn
+          active={activeTab === "outbound"}
+          onClick={() => setActiveTab("outbound")}
+          icon="arrow-up-right-from-circle"
+          label="Ausgang"
+          color="rose"
+        />
       </nav>
     </div>
   );
