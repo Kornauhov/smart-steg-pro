@@ -19,6 +19,11 @@ import { deriveFromPath, safeDocId, slotIdFrom } from "./utils/ids.js";
 import { itemDocRef, slotDocRef } from "./firebase/refs.js";
 import { moveWholeSlot } from "./modules/moveStock.js";
 
+// ✅ NEW: Einlagern OCR + Putaway
+import { ocrLabelFromImageFile } from "./modules/ocrLabel.js";
+import { parseLabelText } from "./modules/parseLabelText.js";
+import { putawayStock } from "./modules/putawayStock.js";
+
 import Icon from "./components/Icon.jsx";
 import StatChip from "./components/StatChip.jsx";
 import NavBtn from "./components/NavBtn.jsx";
@@ -190,7 +195,7 @@ export default function App() {
   const [masterItems, setMasterItems] = useState([]);
   const [searchQuery, setSearchQuery] = useState("");
 
-  // Forms
+  // Forms (legacy)
   const [newStock, setNewStock] = useState({
     itemKey: "",
     shelf: "C1",
@@ -207,6 +212,30 @@ export default function App() {
 
   const shelves = useMemo(() => Array.from({ length: 38 }, (_, i) => `C${i + 1}`), []);
   const levels = [5, 4, 3, 2, 1];
+
+  /* =========================
+     EINLAGERN (NEW: Platz + Barcode + OCR + Manual Suggest)
+========================= */
+  const [inStep, setInStep] = useState("place"); // "place" | "barcode"
+  const [inPlace, setInPlace] = useState(null); // { shelf, level }
+  const [barcodeStegRaw, setBarcodeStegRaw] = useState("");
+
+  const [labelFile, setLabelFile] = useState(null);
+  const [ocrBusy, setOcrBusy] = useState(false);
+  const [ocrProgress, setOcrProgress] = useState(0);
+  const [ocrError, setOcrError] = useState("");
+  const [ocrText, setOcrText] = useState("");
+
+  const [inbound, setInbound] = useState({
+    itemKey: "",
+    lengthMm: "",
+    qty: "",
+    supplier: "",
+    orderNo: "",
+    deliveryDate: new Date().toISOString().slice(0, 10),
+  });
+
+  const [manualStegQuery, setManualStegQuery] = useState("");
 
   /* =========================
      QR MOVE (slot only)
@@ -333,7 +362,8 @@ export default function App() {
 
       const shelf = d.shelf ?? d.location?.shelf ?? derived.shelf;
       const level = Number(d.level ?? d.location?.level ?? derived.level);
-      const slotId = d.slotId ?? derived.slotId ?? (shelf && level ? slotIdFrom(shelf, level) : null);
+      const slotId =
+        d.slotId ?? derived.slotId ?? (shelf && level ? slotIdFrom(shelf, level) : null);
 
       const itemKey = d.itemKey ?? d.key ?? d.code ?? d.__id;
       const quantity = Number(d.quantity) || 0;
@@ -375,7 +405,10 @@ export default function App() {
   }, [itemDocs]);
 
   const occupiedSlots = slotMap.size;
-  const totalParts = useMemo(() => itemDocs.reduce((s, x) => s + (Number(x.quantity) || 0), 0), [itemDocs]);
+  const totalParts = useMemo(
+    () => itemDocs.reduce((s, x) => s + (Number(x.quantity) || 0), 0),
+    [itemDocs]
+  );
 
   /* =========================
      AWB index
@@ -426,7 +459,9 @@ export default function App() {
         const shelfMatch = String(slot.shelf).toUpperCase().includes(term);
         const matched = slot.entries.filter((e) => {
           const keyMatch = String(e.itemKey).toUpperCase().includes(term);
-          const awbMatch = getLinkedAWBs(e.itemKey).some((a) => String(a).toUpperCase().includes(term));
+          const awbMatch = getLinkedAWBs(e.itemKey).some((a) =>
+            String(a).toUpperCase().includes(term)
+          );
           const lvlMatch = `L${slot.level}`.includes(term);
           return keyMatch || awbMatch || shelfMatch || lvlMatch;
         });
@@ -439,7 +474,7 @@ export default function App() {
   }, [groupedSlots, searchQuery, awbIndex]);
 
   /* =========================
-     Add / Remove
+     Add / Remove (legacy add kept)
 ========================= */
   const handleAddStock = async (e) => {
     e.preventDefault();
@@ -454,7 +489,11 @@ export default function App() {
     const iRef = itemDocRef(slotId, itemKey);
 
     try {
-      await setDoc(sRef, { appId: APP_ID, slotId, shelf, level, updatedAt: Date.now() }, { merge: true });
+      await setDoc(
+        sRef,
+        { appId: APP_ID, slotId, shelf, level, updatedAt: Date.now() },
+        { merge: true }
+      );
 
       const snap = await getDoc(iRef);
       if (snap.exists()) {
@@ -527,7 +566,12 @@ export default function App() {
     try {
       const newQty = selected.quantity - qty;
       if (newQty <= 0) await deleteDoc(iRef);
-      else await updateDoc(iRef, { quantity: newQty, updatedAt: Date.now(), lastDestination: outStock.destination });
+      else
+        await updateDoc(iRef, {
+          quantity: newQty,
+          updatedAt: Date.now(),
+          lastDestination: outStock.destination,
+        });
 
       setOutStock({ entryId: "", qty: "", destination: "produktion" });
       setActiveTab("inventory");
@@ -537,90 +581,238 @@ export default function App() {
   };
 
   /* =========================
-     QR APPLY SCAN (FIXED)
+     EINLAGERN logic (NEW)
+========================= */
+  const onScanPlaceForInbound = (decodedText) => {
+    const p = parsePlace(decodedText);
+    if (!p) {
+      alert("❗ Platz ungültig. Erwartet z.B. C1 oder C1-L3");
+      return;
+    }
+    setInPlace(p);
+    setInStep("barcode");
+    try {
+      navigator.vibrate?.(30);
+    } catch {}
+  };
+
+  const onScanBarcodeForInbound = (decodedText) => {
+    const raw = String(decodedText || "").trim();
+    if (!raw) return;
+
+    // Standard: StegNr ist numerisch -> wir ziehen Ziffern
+    const digits = raw.replace(/\D/g, "");
+    const key = digits || raw;
+
+    setBarcodeStegRaw(raw);
+    setInbound((x) => ({ ...x, itemKey: key }));
+    try {
+      navigator.vibrate?.([30, 30]);
+    } catch {}
+  };
+
+  const runOcr = async (file) => {
+    try {
+      setOcrError("");
+      setOcrText("");
+      setOcrBusy(true);
+      setOcrProgress(0);
+
+      const text = await ocrLabelFromImageFile(file, setOcrProgress);
+      setOcrText(text);
+
+      const p = parseLabelText(text);
+      setInbound((x) => ({
+        ...x,
+        // StegNr nur setzen, wenn leer (Barcode/Manual hat Priorität)
+        itemKey: x.itemKey ? x.itemKey : (p.itemKey || ""),
+        lengthMm: p.lengthMm ?? x.lengthMm,
+        qty: p.qty ?? x.qty,
+        supplier: p.supplier ?? x.supplier,
+        orderNo: p.orderNo ?? x.orderNo,
+        deliveryDate: p.deliveryDate ?? x.deliveryDate,
+      }));
+    } catch (e) {
+      console.error(e);
+      setOcrError(e?.message || "OCR Fehler");
+    } finally {
+      setOcrBusy(false);
+    }
+  };
+
+  const doInboundPutaway = async () => {
+    try {
+      if (!inPlace?.shelf) return alert("Bitte zuerst Platz scannen.");
+
+      const itemKey = String(inbound.itemKey || "").trim();
+      const qty = Number(inbound.qty);
+      const lengthMm = Number(inbound.lengthMm);
+
+      if (!itemKey) return alert("Steg-Nr fehlt (Barcode oder manuell).");
+      if (!qty || qty <= 0) return alert("Menge fehlt/ungültig.");
+      if (!lengthMm || lengthMm <= 0) return alert("Länge fehlt/ungültig.");
+
+      const res = await putawayStock({
+        APP_ID,
+        slotDocRef,
+        itemDocRef,
+        slotMap,
+        shelves,
+        levels,
+        itemKey,
+        qty,
+        preferredShelf: inPlace.shelf,
+        preferredLevel: inPlace.level ?? null,
+        source: "anlieferung",
+        meta: {
+          lengthMm,
+          supplier: inbound.supplier || null,
+          orderNo: inbound.orderNo || null,
+          deliveryDate: inbound.deliveryDate || null,
+        },
+      });
+
+      alert(`✅ Eingelagert in ${res.shelf}-L${res.level}`);
+
+      // Reset
+      setInStep("place");
+      setInPlace(null);
+      setBarcodeStegRaw("");
+      setLabelFile(null);
+      setOcrText("");
+      setOcrProgress(0);
+      setOcrBusy(false);
+      setOcrError("");
+      setManualStegQuery("");
+      setInbound({
+        itemKey: "",
+        lengthMm: "",
+        qty: "",
+        supplier: "",
+        orderNo: "",
+        deliveryDate: new Date().toISOString().slice(0, 10),
+      });
+
+      setActiveTab("inventory");
+    } catch (e) {
+      console.error(e);
+      alert(`❗ Fehler: ${e?.message || "Konsole prüfen"}`);
+    }
+  };
+
+  const stegCandidates = useMemo(() => {
+    const q = String(manualStegQuery || "").trim().replace(/\D/g, "");
+    if (!q) return [];
+    return stegItems
+      .map((s) => String(s.code || s.id || ""))
+      .filter(Boolean)
+      .filter((code) => code.startsWith(q))
+      .slice(0, 8);
+  }, [manualStegQuery, stegItems]);
+
+  const suggestedSteg = stegCandidates[0] || "";
+
+  const reqMissing = {
+    place: !inPlace?.shelf,
+    itemKey: !String(inbound.itemKey || "").trim(),
+    qty: !(Number(inbound.qty) > 0),
+    lengthMm: !(Number(inbound.lengthMm) > 0),
+  };
+
+  const canPutaway =
+    !ocrBusy &&
+    !reqMissing.place &&
+    !reqMissing.itemKey &&
+    !reqMissing.qty &&
+    !reqMissing.lengthMm;
+
+  /* =========================
+     QR APPLY SCAN (MOVE)
 ========================= */
   const applyScan = (raw) => {
-  if (moving || confirmOpen) return;
+    if (moving || confirmOpen) return;
 
-  const now = Date.now();
+    const now = Date.now();
 
-  // Global ignore window (already used)
-  if (now < ignoreUntilRef.current) return;
+    // Global ignore window (already used)
+    if (now < ignoreUntilRef.current) return;
 
-  const val = String(raw || "").trim();
-  if (!val) return;
+    const val = String(raw || "").trim();
+    if (!val) return;
 
-  // Anti-spam: same text too fast
-  if (val === lastScan.value && now - lastScan.at < 900) return;
-  setLastScan({ value: val, at: now });
+    // Anti-spam: same text too fast
+    if (val === lastScan.value && now - lastScan.at < 900) return;
+    setLastScan({ value: val, at: now });
 
-  const parsed = parsePlace(val);
-  if (!parsed) {
-    alert("❗ QR ungültig. Erwartet z.B. C8 oder C8-L3");
-    return;
-  }
-
-  const step = stepRef.current;
-
-  // ===== SETTINGS =====
-  const cooldownAfterSourceMs = 1200; // <- wichtig gegen doppelscan
-  const sourceSetAtRef = applyScan.sourceSetAtRef || (applyScan.sourceSetAtRef = { t: 0 });
-  const sourceShelfRef = applyScan.sourceShelfRef || (applyScan.sourceShelfRef = { shelf: null });
-
-  if (step === "source") {
-    const lvl = parsed.level ?? findTopOccupiedLevel(slotMap, parsed.shelf, levels);
-    if (!lvl) {
-      alert(`ℹ️ ${parsed.shelf} hat keinen Bestand.`);
+    const parsed = parsePlace(val);
+    if (!parsed) {
+      alert("❗ QR ungültig. Erwartet z.B. C8 oder C8-L3");
       return;
     }
 
-    // set source
-    setQrSource({ shelf: parsed.shelf, level: lvl });
+    const step = stepRef.current;
 
-    // switch immediately to target
-    stepRef.current = "target";
+    // ===== SETTINGS =====
+    const cooldownAfterSourceMs = 1200; // <- wichtig gegen doppelscan
+    const sourceSetAtRef =
+      applyScan.sourceSetAtRef || (applyScan.sourceSetAtRef = { t: 0 });
+    const sourceShelfRef =
+      applyScan.sourceShelfRef || (applyScan.sourceShelfRef = { shelf: null });
 
-    // remember source shelf + time
-    sourceShelfRef.shelf = parsed.shelf;
-    sourceSetAtRef.t = Date.now();
+    if (step === "source") {
+      const lvl = parsed.level ?? findTopOccupiedLevel(slotMap, parsed.shelf, levels);
+      if (!lvl) {
+        alert(`ℹ️ ${parsed.shelf} hat keinen Bestand.`);
+        return;
+      }
 
-    // HARD freeze for short time -> ignores the "next frames"
-    ignoreUntilRef.current = Date.now() + cooldownAfterSourceMs;
+      // set source
+      setQrSource({ shelf: parsed.shelf, level: lvl });
 
-    try { navigator.vibrate?.(30); } catch {}
-    return;
-  }
+      // switch immediately to target
+      stepRef.current = "target";
 
-  // ===== TARGET =====
+      // remember source shelf + time
+      sourceShelfRef.shelf = parsed.shelf;
+      sourceSetAtRef.t = Date.now();
 
-  // 1) Too fast after source? ignore (extra safety besides ignoreUntilRef)
-  if (now - sourceSetAtRef.t < cooldownAfterSourceMs) {
-    return; // still cooling down
-  }
+      // HARD freeze for short time -> ignores the "next frames"
+      ignoreUntilRef.current = Date.now() + cooldownAfterSourceMs;
 
-  // 2) Optional but recommended: target must be DIFFERENT shelf than source
-  if (sourceShelfRef.shelf && parsed.shelf === sourceShelfRef.shelf) {
-    // ignore and tell user what to do
-    alert(`ℹ️ Ziel muss ein anderes Regal sein als die Quelle (${sourceShelfRef.shelf}).`);
-    // small ignore to avoid repeated alerts from same QR
-    ignoreUntilRef.current = Date.now() + 800;
-    return;
-  }
+      try {
+        navigator.vibrate?.(30);
+      } catch {}
+      return;
+    }
 
-  const lvl = parsed.level ?? findBottomEmptyLevel(slotMap, parsed.shelf, levels);
-  if (!lvl) {
-    alert(`❗ ${parsed.shelf} ist voll.`);
-    ignoreUntilRef.current = Date.now() + 800;
-    return;
-  }
+    // ===== TARGET =====
 
-  setQrTarget({ shelf: parsed.shelf, level: lvl });
+    // 1) Too fast after source? ignore (extra safety besides ignoreUntilRef)
+    if (now - sourceSetAtRef.t < cooldownAfterSourceMs) {
+      return; // still cooling down
+    }
 
-  // open confirm -> scanner pauses
-  setConfirmOpen(true);
+    // 2) Optional but recommended: target must be DIFFERENT shelf than source
+    if (sourceShelfRef.shelf && parsed.shelf === sourceShelfRef.shelf) {
+      alert(`ℹ️ Ziel muss ein anderes Regal sein als die Quelle (${sourceShelfRef.shelf}).`);
+      ignoreUntilRef.current = Date.now() + 800;
+      return;
+    }
 
-  try { navigator.vibrate?.([30, 30, 30]); } catch {}
-};
+    const lvl = parsed.level ?? findBottomEmptyLevel(slotMap, parsed.shelf, levels);
+    if (!lvl) {
+      alert(`❗ ${parsed.shelf} ist voll.`);
+      ignoreUntilRef.current = Date.now() + 800;
+      return;
+    }
+
+    setQrTarget({ shelf: parsed.shelf, level: lvl });
+    setConfirmOpen(true);
+
+    try {
+      navigator.vibrate?.([30, 30, 30]);
+    } catch {}
+  };
 
   const doMove = async () => {
     if (!qrSource.shelf || !qrTarget.shelf) return;
@@ -660,7 +852,9 @@ export default function App() {
     return (
       <div className="h-screen flex flex-col items-center justify-center bg-slate-900 text-yellow-500">
         <div className="w-16 h-16 border-4 border-yellow-500 border-t-transparent rounded-full animate-spin mb-6"></div>
-        <p className="font-black italic uppercase tracking-widest">System wird initialisiert...</p>
+        <p className="font-black italic uppercase tracking-widest">
+          System wird initialisiert...
+        </p>
       </div>
     );
   }
@@ -669,10 +863,18 @@ export default function App() {
     <div className="max-w-4xl mx-auto min-h-screen pb-36 relative">
       {DEBUG && (
         <div className="fixed top-3 right-3 z-[999] bg-white/90 backdrop-blur border border-slate-200 shadow-lg rounded-2xl px-4 py-3 text-[11px] font-bold text-slate-700">
-          <div>RAW docs: <span className="text-slate-900">{rawItems.length}</span></div>
-          <div>APP docs: <span className="text-slate-900">{itemDocs.length}</span></div>
-          <div>Slots: <span className="text-slate-900">{occupiedSlots}</span></div>
-          <div>Sum qty: <span className="text-slate-900">{totalParts}</span></div>
+          <div>
+            RAW docs: <span className="text-slate-900">{rawItems.length}</span>
+          </div>
+          <div>
+            APP docs: <span className="text-slate-900">{itemDocs.length}</span>
+          </div>
+          <div>
+            Slots: <span className="text-slate-900">{occupiedSlots}</span>
+          </div>
+          <div>
+            Sum qty: <span className="text-slate-900">{totalParts}</span>
+          </div>
         </div>
       )}
 
@@ -698,16 +900,28 @@ export default function App() {
           <div className="space-y-6">
             <div className="grid grid-cols-3 gap-3">
               <div className="bg-white p-4 rounded-3xl shadow-sm border border-slate-200">
-                <p className="text-[9px] font-black text-slate-400 uppercase mb-1">Stege DB</p>
-                <p className="text-2xl font-black text-slate-800 leading-none">{stegItems.length}</p>
+                <p className="text-[9px] font-black text-slate-400 uppercase mb-1">
+                  Stege DB
+                </p>
+                <p className="text-2xl font-black text-slate-800 leading-none">
+                  {stegItems.length}
+                </p>
               </div>
               <div className="bg-white p-4 rounded-3xl shadow-sm border border-slate-200">
-                <p className="text-[9px] font-black text-slate-400 uppercase mb-1">Teile Gesamt</p>
-                <p className="text-2xl font-black text-yellow-600 leading-none">{totalParts}</p>
+                <p className="text-[9px] font-black text-slate-400 uppercase mb-1">
+                  Teile Gesamt
+                </p>
+                <p className="text-2xl font-black text-yellow-600 leading-none">
+                  {totalParts}
+                </p>
               </div>
               <div className="bg-white p-4 rounded-3xl shadow-sm border border-slate-200">
-                <p className="text-[9px] font-black text-slate-400 uppercase mb-1">Belegte Plätze</p>
-                <p className="text-2xl font-black text-slate-800 leading-none">{occupiedSlots}/190</p>
+                <p className="text-[9px] font-black text-slate-400 uppercase mb-1">
+                  Belegte Plätze
+                </p>
+                <p className="text-2xl font-black text-slate-800 leading-none">
+                  {occupiedSlots}/190
+                </p>
               </div>
             </div>
 
@@ -716,7 +930,9 @@ export default function App() {
                 <h3 className="text-xs font-black uppercase text-yellow-500 tracking-widest flex items-center gap-2">
                   <Icon name="grid" size={16} /> Aktuelle Belegung
                 </h3>
-                <span className="text-[10px] text-slate-500 font-bold">Gestell C1 - C38</span>
+                <span className="text-[10px] text-slate-500 font-bold">
+                  Gestell C1 - C38
+                </span>
               </div>
 
               <div className="overflow-x-auto custom-scrollbar pb-4">
@@ -736,11 +952,15 @@ export default function App() {
                               setActiveTab("inventory");
                             }}
                             className={`w-7 h-7 rounded-lg shadow-inner flex items-center justify-center ${
-                              count ? "bg-yellow-500 shadow-yellow-500/20 cursor-pointer" : "bg-slate-800 opacity-20"
+                              count
+                                ? "bg-yellow-500 shadow-yellow-500/20 cursor-pointer"
+                                : "bg-slate-800 opacity-20"
                             }`}
                             title={`${s} - L${l}`}
                           >
-                            {count ? <span className="text-[11px] font-black text-slate-900">{count}</span> : null}
+                            {count ? (
+                              <span className="text-[11px] font-black text-slate-900">{count}</span>
+                            ) : null}
                           </div>
                         );
                       })}
@@ -776,7 +996,9 @@ export default function App() {
                     X
                   </button>
                 )}
-                <div className="text-slate-300"><Icon name="search" size={20} /></div>
+                <div className="text-slate-300">
+                  <Icon name="search" size={20} />
+                </div>
               </div>
             </div>
 
@@ -801,7 +1023,10 @@ export default function App() {
                 </div>
               ) : (
                 filteredSlots.map((slot) => (
-                  <div key={`${slot.shelf}|${slot.level}`} className="bg-white p-5 rounded-[2rem] shadow-sm border border-slate-200">
+                  <div
+                    key={`${slot.shelf}|${slot.level}`}
+                    className="bg-white p-5 rounded-[2rem] shadow-sm border border-slate-200"
+                  >
                     <div className="flex items-center justify-between mb-3">
                       <span className="text-[15px] font-black bg-slate-900 text-yellow-500 px-3 py-1 rounded-full">
                         {slot.shelf} - L{slot.level}
@@ -815,7 +1040,10 @@ export default function App() {
                       {slot.entries.map((entry) => {
                         const linked = getLinkedAWBs(entry.itemKey);
                         return (
-                          <div key={entry.id} className="flex items-center justify-between bg-slate-50 rounded-2xl px-4 py-3 border border-slate-100">
+                          <div
+                            key={entry.id}
+                            className="flex items-center justify-between bg-slate-50 rounded-2xl px-4 py-3 border border-slate-100"
+                          >
                             <div className="min-w-0 pr-3">
                               <div className="font-black text-slate-800 truncate">{entry.itemKey}</div>
                               <div className="text-[11px] text-slate-400 font-bold uppercase truncate">
@@ -840,233 +1068,364 @@ export default function App() {
           </div>
         )}
 
-        {/* ADD */}
+        {/* ADD (REPLACED) */}
         {activeTab === "add" && (
-          <div className="bg-white p-8 rounded-[2.5rem] shadow-xl border border-slate-200 space-y-6">
-            <div className="flex items-center gap-3">
-              <div className="p-2 bg-emerald-100 text-emerald-600 rounded-xl"><Icon name="arrow-down-to-dot" /></div>
-              <h3 className="font-black uppercase text-slate-800 italic text-xl">Wareneingang</h3>
-            </div>
-
-            <form onSubmit={handleAddStock} className="space-y-5">
-              <div className="flex gap-2 p-1 bg-slate-100 rounded-2xl">
-                <button
-                  type="button"
-                  onClick={() => setNewStock({ ...newStock, source: "anlieferung" })}
-                  className={`flex-1 py-3 rounded-xl text-[10px] font-black uppercase transition-all ${
-                    newStock.source === "anlieferung" ? "bg-white shadow-sm text-emerald-600" : "text-slate-400"
-                  }`}
-                >
-                  Anlieferung
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setNewStock({ ...newStock, source: "produktion" })}
-                  className={`flex-1 py-3 rounded-xl text-[10px] font-black uppercase transition-all ${
-                    newStock.source === "produktion" ? "bg-white shadow-sm text-blue-600" : "text-slate-400"
-                  }`}
-                >
-                  Rücklauf
-                </button>
-              </div>
-
-              <div className="space-y-1">
-                <label className="text-[10px] font-black uppercase text-slate-400 ml-4">Steg auswählen</label>
-                <select
-                  required
-                  value={newStock.itemKey}
-                  onChange={(e) => setNewStock({ ...newStock, itemKey: e.target.value })}
-                  className="w-full p-4 bg-slate-50 rounded-2xl font-bold border-2 border-slate-100 appearance-none outline-none focus:border-emerald-400"
-                >
-                  <option value="">-- Typ wählen --</option>
-                  {stegItems.map((s) => (
-                    <option key={s.id} value={s.code}>{s.code}</option>
-                  ))}
-                </select>
-              </div>
-
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-1">
-                  <label className="text-[10px] font-black uppercase text-slate-400 ml-4">Regal (C)</label>
-                  <select
-                    value={newStock.shelf}
-                    onChange={(e) => setNewStock({ ...newStock, shelf: e.target.value })}
-                    className="w-full p-4 bg-slate-50 rounded-2xl font-bold border-2 border-slate-100 outline-none"
-                  >
-                    {shelves.map((s) => <option key={s} value={s}>{s}</option>)}
-                  </select>
+          <div className="space-y-4">
+            <div className="bg-white p-7 rounded-[2.5rem] shadow-xl border border-slate-200 space-y-5">
+              <div className="flex items-center gap-3">
+                <div className="p-2 bg-emerald-100 text-emerald-600 rounded-xl">
+                  <Icon name="arrow-down-to-dot" />
                 </div>
-                <div className="space-y-1">
-                  <label className="text-[10px] font-black uppercase text-slate-400 ml-4">Ebene</label>
-                  <select
-                    value={newStock.level}
-                    onChange={(e) => setNewStock({ ...newStock, level: Number(e.target.value) })}
-                    className="w-full p-4 bg-slate-50 rounded-2xl font-bold border-2 border-slate-100 outline-none"
-                  >
-                    {levels.map((l) => <option key={l} value={l}>Ebene {l}</option>)}
-                  </select>
+                <div className="min-w-0">
+                  <h3 className="font-black uppercase text-slate-800 italic text-xl leading-tight">
+                    Einlagern
+                  </h3>
+                  <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+                    Platz scannen → Barcode (Steg Nr) → Etikett Foto (OCR) → Bestätigen
+                  </p>
                 </div>
               </div>
 
-              <div className="space-y-1">
-                <label className="text-[10px] font-black uppercase text-slate-400 ml-4">Stückzahl</label>
-                <input
-                  required
-                  type="number"
-                  min="1"
-                  placeholder="Menge..."
-                  value={newStock.qty}
-                  onChange={(e) => setNewStock({ ...newStock, qty: e.target.value })}
-                  className="w-full p-4 bg-slate-50 rounded-2xl font-bold border-2 border-slate-100 outline-none focus:border-emerald-400"
+              <div className="flex gap-2 flex-wrap">
+                <StatChip
+                  label="Schritt"
+                  value={inStep === "place" ? "Platz scannen" : "Barcode scannen"}
+                  tone="emerald"
+                />
+                <StatChip
+                  label="Platz"
+                  value={
+                    inPlace?.shelf ? `${inPlace.shelf}${inPlace.level ? `-L${inPlace.level}` : ""}` : "—"
+                  }
+                  tone={inPlace?.shelf ? "emerald" : "slate"}
+                />
+                <StatChip
+                  label="Steg"
+                  value={inbound.itemKey ? inbound.itemKey : "—"}
+                  tone={inbound.itemKey ? "emerald" : "slate"}
                 />
               </div>
 
-              <button
-                type="submit"
-                className="w-full py-5 bg-emerald-600 text-white rounded-[1.5rem] font-black uppercase shadow-lg shadow-emerald-600/20 active:scale-95 transition-all sticky bottom-4"
-              >
-                Einlagern bestätigen
-              </button>
-            </form>
+              <QRScanner
+                enabled={true}
+                onResult={(txt) => {
+                  if (inStep === "place") onScanPlaceForInbound(txt);
+                  else onScanBarcodeForInbound(txt);
+                }}
+                onError={() => {}}
+              />
+
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setInStep("place");
+                    setInPlace(null);
+                  }}
+                  className="flex-1 py-3 bg-slate-100 rounded-xl font-black text-[11px] text-slate-700"
+                >
+                  Platz zurücksetzen
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setInbound((x) => ({ ...x, itemKey: "" }));
+                    setBarcodeStegRaw("");
+                    setInStep("barcode");
+                  }}
+                  className="flex-1 py-3 bg-slate-100 rounded-xl font-black text-[11px] text-slate-700"
+                >
+                  Steg zurücksetzen
+                </button>
+              </div>
+
+              {/* Barcode info */}
+              <div className="text-[10px] font-bold text-slate-500">
+                Barcode gelesen: <span className="text-slate-900">{barcodeStegRaw || "—"}</span>
+              </div>
+
+              {/* OCR Upload (AUTO) */}
+              <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-3">
+                <div className="text-[10px] font-black uppercase text-slate-400">
+                  Etikett Foto (OCR)
+                </div>
+
+                <input
+                  type="file"
+                  accept="image/*"
+                  onChange={(e) => {
+                    const f = e.target.files?.[0] || null;
+                    setLabelFile(f);
+                    if (f) runOcr(f);
+                  }}
+                  className="w-full"
+                />
+
+                {ocrBusy ? (
+                  <div className="text-xs font-bold text-slate-600">OCR läuft… {ocrProgress}%</div>
+                ) : null}
+
+                {ocrError ? <div className="text-xs font-black text-red-600">{ocrError}</div> : null}
+
+                {ocrText ? (
+                  <details className="text-xs">
+                    <summary className="font-black cursor-pointer">OCR-Text anzeigen</summary>
+                    <pre className="whitespace-pre-wrap mt-2 p-3 rounded-xl bg-white border">
+                      {ocrText}
+                    </pre>
+                  </details>
+                ) : null}
+              </div>
+
+              {/* DATA FORM */}
+              <div className="bg-white border border-slate-200 rounded-2xl p-4 space-y-2">
+                <div className="text-[10px] font-black uppercase text-slate-400">Daten prüfen</div>
+
+                {!inPlace?.shelf ? (
+                  <div className="text-xs font-black text-red-600">Bitte zuerst Platz scannen.</div>
+                ) : null}
+
+                <input
+                  value={inbound.itemKey}
+                  onChange={(e) => setInbound((x) => ({ ...x, itemKey: e.target.value }))}
+                  placeholder="Steg Nr (Barcode oder manuell)"
+                  className={`w-full p-3 rounded-2xl border-2 font-bold outline-none ${
+                    reqMissing.itemKey ? "border-red-400 bg-red-50" : "border-slate-100 bg-white"
+                  }`}
+                />
+
+                <input
+                  value={inbound.lengthMm}
+                  onChange={(e) => setInbound((x) => ({ ...x, lengthMm: e.target.value }))}
+                  placeholder="Länge (mm)"
+                  className={`w-full p-3 rounded-2xl border-2 font-bold outline-none ${
+                    reqMissing.lengthMm ? "border-red-400 bg-red-50" : "border-slate-100 bg-white"
+                  }`}
+                />
+
+                <input
+                  value={inbound.qty}
+                  onChange={(e) => setInbound((x) => ({ ...x, qty: e.target.value }))}
+                  placeholder="Menge"
+                  className={`w-full p-3 rounded-2xl border-2 font-bold outline-none ${
+                    reqMissing.qty ? "border-red-400 bg-red-50" : "border-slate-100 bg-white"
+                  }`}
+                />
+
+                <input
+                  value={inbound.supplier}
+                  onChange={(e) => setInbound((x) => ({ ...x, supplier: e.target.value }))}
+                  placeholder="Lieferant"
+                  className="w-full p-3 rounded-2xl border-2 border-slate-100 font-bold outline-none"
+                />
+
+                <input
+                  value={inbound.orderNo}
+                  onChange={(e) => setInbound((x) => ({ ...x, orderNo: e.target.value }))}
+                  placeholder="Bestellung"
+                  className="w-full p-3 rounded-2xl border-2 border-slate-100 font-bold outline-none"
+                />
+
+                <input
+                  type="date"
+                  value={inbound.deliveryDate}
+                  onChange={(e) => setInbound((x) => ({ ...x, deliveryDate: e.target.value }))}
+                  className="w-full p-3 rounded-2xl border-2 border-slate-100 font-bold outline-none"
+                />
+
+                <button
+                  type="button"
+                  onClick={doInboundPutaway}
+                  disabled={!canPutaway}
+                  className={`w-full py-4 rounded-[1.2rem] font-black uppercase text-white shadow-lg active:scale-95 transition-all ${
+                    canPutaway
+                      ? "bg-emerald-600 shadow-emerald-600/20"
+                      : "bg-slate-300 shadow-none cursor-not-allowed"
+                  }`}
+                >
+                  {ocrBusy ? `OCR läuft… (${ocrProgress}%)` : "Einlagern bestätigen"}
+                </button>
+
+                <div className="text-[10px] text-slate-500 font-bold text-center">
+                  Wenn du nur <b>C1</b> scannst: Einlagerung in die <b>unterste freie Ebene</b> von C1.
+                </div>
+              </div>
+
+              {/* MANUAL STEG PICKER (BOTTOM) */}
+              <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-3">
+                <div className="text-[10px] font-black uppercase text-slate-400">
+                  Manuell Steg auswählen (Dropdown / Vorschlag)
+                </div>
+
+                <input
+                  value={manualStegQuery}
+                  onChange={(e) => setManualStegQuery(e.target.value)}
+                  placeholder="erste Zahlen tippen… z.B. 284"
+                  className="w-full p-3 bg-white rounded-xl font-bold border-2 border-slate-100 outline-none"
+                />
+
+                {suggestedSteg ? (
+                  <button
+                    type="button"
+                    onClick={() => setInbound((x) => ({ ...x, itemKey: suggestedSteg }))}
+                    className="w-full px-4 py-3 rounded-xl bg-white border border-slate-200 font-black text-left"
+                  >
+                    Vorschlag: <span className="text-emerald-700">{suggestedSteg}</span> (antippen)
+                  </button>
+                ) : (
+                  <div className="text-xs font-bold text-slate-500">Kein Vorschlag</div>
+                )}
+
+                {stegCandidates.length > 1 ? (
+                  <div className="grid grid-cols-2 gap-2">
+                    {stegCandidates.slice(1).map((k) => (
+                      <button
+                        key={k}
+                        type="button"
+                        onClick={() => setInbound((x) => ({ ...x, itemKey: k }))}
+                        className="px-3 py-2 rounded-xl bg-white border border-slate-200 font-bold text-sm"
+                      >
+                        {k}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            </div>
           </div>
         )}
 
-{/* MOVE (QR SLOT ONLY) */}
-{activeTab === "move" && (
-  <div className="space-y-4">
-    <div className="bg-white p-7 rounded-[2.5rem] shadow-xl border border-slate-200 space-y-5">
-      {/* Header */}
-      <div className="flex items-center gap-3">
-        <div className="p-2 bg-blue-100 text-blue-600 rounded-xl">
-          <Icon name="qr-code" />
-        </div>
-        <div className="min-w-0">
-          <h3 className="font-black uppercase text-slate-800 italic text-xl leading-tight">
-            Umlagern (QR)
-          </h3>
-          <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
-            Quelle scannen → Ziel scannen → Bestätigen
-          </p>
-        </div>
-      </div>
+        {/* MOVE (QR SLOT ONLY) */}
+        {activeTab === "move" && (
+          <div className="space-y-4">
+            <div className="bg-white p-7 rounded-[2.5rem] shadow-xl border border-slate-200 space-y-5">
+              <div className="flex items-center gap-3">
+                <div className="p-2 bg-blue-100 text-blue-600 rounded-xl">
+                  <Icon name="qr-code" />
+                </div>
+                <div className="min-w-0">
+                  <h3 className="font-black uppercase text-slate-800 italic text-xl leading-tight">
+                    Umlagern (QR)
+                  </h3>
+                  <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+                    Quelle scannen → Ziel scannen → Bestätigen
+                  </p>
+                </div>
+              </div>
 
-      {/* Compact status chips */}
-      <div className="flex gap-2 flex-wrap">
-        <StatChip
-          label="Modus"
-          value={stepRef.current === "source" ? "Quelle scannen" : "Ziel scannen"}
-          tone="blue"
-        />
-        <StatChip
-          label="Quelle"
-          value={qrSource.shelf ? `${qrSource.shelf}-L${qrSource.level}` : "—"}
-          tone={qrSource.shelf ? "emerald" : "slate"}
-        />
-        <StatChip
-          label="Ziel"
-          value={qrTarget.shelf ? `${qrTarget.shelf}-L${qrTarget.level}` : "—"}
-          tone={qrTarget.shelf ? "emerald" : "slate"}
-        />
-      </div>
+              <div className="flex gap-2 flex-wrap">
+                <StatChip
+                  label="Modus"
+                  value={stepRef.current === "source" ? "Quelle scannen" : "Ziel scannen"}
+                  tone="blue"
+                />
+                <StatChip
+                  label="Quelle"
+                  value={qrSource.shelf ? `${qrSource.shelf}-L${qrSource.level}` : "—"}
+                  tone={qrSource.shelf ? "emerald" : "slate"}
+                />
+                <StatChip
+                  label="Ziel"
+                  value={qrTarget.shelf ? `${qrTarget.shelf}-L${qrTarget.level}` : "—"}
+                  tone={qrTarget.shelf ? "emerald" : "slate"}
+                />
+              </div>
 
-      {/* ✅ Confirmation above camera (only source/target + 1 button) */}
-      {confirmOpen && qrSource.shelf && qrTarget.shelf ? (
-        <div className="bg-blue-50 border border-blue-200 rounded-[1.5rem] p-4">
-          <div className="text-[10px] font-black uppercase text-blue-700 tracking-widest mb-2">
-            Umlagerung bestätigen
-          </div>
+              {confirmOpen && qrSource.shelf && qrTarget.shelf ? (
+                <div className="bg-blue-50 border border-blue-200 rounded-[1.5rem] p-4">
+                  <div className="text-[10px] font-black uppercase text-blue-700 tracking-widest mb-2">
+                    Umlagerung bestätigen
+                  </div>
 
-          <div className="grid grid-cols-2 gap-3">
-            <div className="bg-white border border-slate-200 rounded-2xl p-3">
-              <div className="text-[10px] font-black uppercase text-slate-400">Quelle</div>
-              <div className="font-black text-slate-900 text-lg">
-                {qrSource.shelf}-L{qrSource.level}
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="bg-white border border-slate-200 rounded-2xl p-3">
+                      <div className="text-[10px] font-black uppercase text-slate-400">Quelle</div>
+                      <div className="font-black text-slate-900 text-lg">
+                        {qrSource.shelf}-L{qrSource.level}
+                      </div>
+                    </div>
+
+                    <div className="bg-white border border-slate-200 rounded-2xl p-3">
+                      <div className="text-[10px] font-black uppercase text-slate-400">Ziel</div>
+                      <div className="font-black text-slate-900 text-lg">
+                        {qrTarget.shelf}-L{qrTarget.level}
+                      </div>
+                    </div>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      setConfirmOpen(false);
+                      await doMove();
+                    }}
+                    disabled={moving}
+                    className={`w-full mt-4 py-4 text-white rounded-[1.2rem] font-black uppercase shadow-lg active:scale-95 transition-all ${
+                      moving
+                        ? "bg-slate-400 shadow-none cursor-not-allowed"
+                        : "bg-blue-700 shadow-blue-700/20"
+                    }`}
+                  >
+                    {moving ? "Umlagern..." : "Bestätigen"}
+                  </button>
+
+                  <div className="mt-2 text-[10px] text-blue-700/80 font-bold text-center">
+                    Scanner ist pausiert bis zur Bestätigung.
+                  </div>
+                </div>
+              ) : null}
+
+              <QRScanner enabled={scannerEnabled} onResult={applyScan} onError={() => {}} />
+
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={resetSource}
+                  className="flex-1 py-3 bg-slate-100 rounded-xl font-black text-[11px] text-slate-700"
+                >
+                  Quelle zurücksetzen
+                </button>
+                <button
+                  type="button"
+                  onClick={resetTarget}
+                  className="flex-1 py-3 bg-slate-100 rounded-xl font-black text-[11px] text-slate-700"
+                >
+                  Ziel zurücksetzen
+                </button>
+              </div>
+
+              <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-3">
+                <div className="text-[10px] font-black uppercase text-slate-400">Fallback</div>
+
+                <input
+                  value={qrTextFallback}
+                  onChange={(e) => setQrTextFallback(e.target.value)}
+                  placeholder="z.B. C8 oder C8-L3"
+                  className="w-full p-3 bg-white rounded-xl font-bold border-2 border-slate-100 outline-none"
+                />
+
+                <div className="flex justify-center">
+                  <button
+                    type="button"
+                    onClick={() => applyScan(qrTextFallback)}
+                    disabled={moving || confirmOpen}
+                    className={`px-10 py-3 rounded-xl font-black active:scale-95 transition-all ${
+                      moving || confirmOpen
+                        ? "bg-slate-300 text-white cursor-not-allowed"
+                        : "bg-slate-900 text-yellow-500"
+                    }`}
+                  >
+                    Anwenden
+                  </button>
+                </div>
+
+                <div className="text-[10px] text-slate-500 font-bold text-center">
+                  Quelle: oberste belegte Ebene • Ziel: unterste freie Ebene
+                </div>
               </div>
             </div>
-
-            <div className="bg-white border border-slate-200 rounded-2xl p-3">
-              <div className="text-[10px] font-black uppercase text-slate-400">Ziel</div>
-              <div className="font-black text-slate-900 text-lg">
-                {qrTarget.shelf}-L{qrTarget.level}
-              </div>
-            </div>
           </div>
-
-          <button
-            type="button"
-            onClick={async () => {
-              // confirm overlay closes, move executes
-              setConfirmOpen(false);
-              await doMove();
-            }}
-            disabled={moving}
-            className={`w-full mt-4 py-4 text-white rounded-[1.2rem] font-black uppercase shadow-lg active:scale-95 transition-all ${
-              moving ? "bg-slate-400 shadow-none cursor-not-allowed" : "bg-blue-700 shadow-blue-700/20"
-            }`}
-          >
-            {moving ? "Umlagern..." : "Bestätigen"}
-          </button>
-
-          <div className="mt-2 text-[10px] text-blue-700/80 font-bold text-center">
-            Scanner ist pausiert bis zur Bestätigung.
-          </div>
-        </div>
-      ) : null}
-
-      {/* Camera */}
-      <QRScanner enabled={scannerEnabled} onResult={applyScan} onError={() => {}} />
-
-      {/* Reset buttons (still useful) */}
-      <div className="flex gap-2">
-        <button
-          type="button"
-          onClick={resetSource}
-          className="flex-1 py-3 bg-slate-100 rounded-xl font-black text-[11px] text-slate-700"
-        >
-          Quelle zurücksetzen
-        </button>
-        <button
-          type="button"
-          onClick={resetTarget}
-          className="flex-1 py-3 bg-slate-100 rounded-xl font-black text-[11px] text-slate-700"
-        >
-          Ziel zurücksetzen
-        </button>
-      </div>
-
-      {/* ✅ Fallback ganz nach unten */}
-      <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-3">
-        <div className="text-[10px] font-black uppercase text-slate-400">Fallback</div>
-
-        <input
-          value={qrTextFallback}
-          onChange={(e) => setQrTextFallback(e.target.value)}
-          placeholder="z.B. C8 oder C8-L3"
-          className="w-full p-3 bg-white rounded-xl font-bold border-2 border-slate-100 outline-none"
-        />
-
-        <div className="flex justify-center">
-          <button
-            type="button"
-            onClick={() => applyScan(qrTextFallback)}
-            disabled={moving || confirmOpen}
-            className={`px-10 py-3 rounded-xl font-black active:scale-95 transition-all ${
-              moving || confirmOpen
-                ? "bg-slate-300 text-white cursor-not-allowed"
-                : "bg-slate-900 text-yellow-500"
-            }`}
-          >
-            Anwenden
-          </button>
-        </div>
-
-        <div className="text-[10px] text-slate-500 font-bold text-center">
-          Quelle: oberste belegte Ebene • Ziel: unterste freie Ebene
-        </div>
-      </div>
-    </div>
-  </div>
-)}
+        )}
 
         {/* OUTBOUND */}
         {activeTab === "outbound" && (
@@ -1080,7 +1439,9 @@ export default function App() {
 
             <form onSubmit={handleRemoveStock} className="space-y-5">
               <div className="space-y-1">
-                <label className="text-[10px] font-black uppercase text-slate-400 ml-4">Eintrag wählen</label>
+                <label className="text-[10px] font-black uppercase text-slate-400 ml-4">
+                  Eintrag wählen
+                </label>
                 <select
                   required
                   value={outStock.entryId}
@@ -1097,7 +1458,9 @@ export default function App() {
               </div>
 
               <div className="space-y-1">
-                <label className="text-[10px] font-black uppercase text-slate-400 ml-4">Verwendung</label>
+                <label className="text-[10px] font-black uppercase text-slate-400 ml-4">
+                  Verwendung
+                </label>
                 <select
                   value={outStock.destination}
                   onChange={(e) => setOutStock({ ...outStock, destination: e.target.value })}
@@ -1110,7 +1473,9 @@ export default function App() {
               </div>
 
               <div className="space-y-1">
-                <label className="text-[10px] font-black uppercase text-slate-400 ml-4">Entnahmemenge</label>
+                <label className="text-[10px] font-black uppercase text-slate-400 ml-4">
+                  Entnahmemenge
+                </label>
                 <input
                   required
                   type="number"
@@ -1134,11 +1499,39 @@ export default function App() {
       </main>
 
       <nav className="fixed bottom-5 left-1/2 -translate-x-1/2 w-[94%] max-w-[560px] glass-effect rounded-[2.5rem] p-2.5 flex justify-around shadow-2xl border border-white/10 z-[100]">
-        <NavBtn active={activeTab === "dashboard"} onClick={() => setActiveTab("dashboard")} icon="layout-dashboard" label="Home" />
-        <NavBtn active={activeTab === "inventory"} onClick={() => setActiveTab("inventory")} icon="boxes" label="Bestand" />
-        <NavBtn active={activeTab === "add"} onClick={() => setActiveTab("add")} icon="arrow-down-to-dot" label="Eingang" color="emerald" />
-        <NavBtn active={activeTab === "move"} onClick={() => setActiveTab("move")} icon="shuffle" label="Umlagern" color="blue" />
-        <NavBtn active={activeTab === "outbound"} onClick={() => setActiveTab("outbound")} icon="arrow-up-right-from-circle" label="Ausgang" color="rose" />
+        <NavBtn
+          active={activeTab === "dashboard"}
+          onClick={() => setActiveTab("dashboard")}
+          icon="layout-dashboard"
+          label="Home"
+        />
+        <NavBtn
+          active={activeTab === "inventory"}
+          onClick={() => setActiveTab("inventory")}
+          icon="boxes"
+          label="Bestand"
+        />
+        <NavBtn
+          active={activeTab === "add"}
+          onClick={() => setActiveTab("add")}
+          icon="arrow-down-to-dot"
+          label="Eingang"
+          color="emerald"
+        />
+        <NavBtn
+          active={activeTab === "move"}
+          onClick={() => setActiveTab("move")}
+          icon="shuffle"
+          label="Umlagern"
+          color="blue"
+        />
+        <NavBtn
+          active={activeTab === "outbound"}
+          onClick={() => setActiveTab("outbound")}
+          icon="arrow-up-right-from-circle"
+          label="Ausgang"
+          color="rose"
+        />
       </nav>
     </div>
   );
