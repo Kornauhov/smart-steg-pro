@@ -590,48 +590,70 @@ export default function App() {
     setLastScan({ value: "", at: 0 });
   };
 
-  const applyScan = (raw) => {
-    if (scanLocked || confirmOpen || moving) return;
+const applyScan = (raw) => {
+  // harte Sperre: wenn Confirm offen / moving / lock
+  if (scanLockRef.current || confirmOpen || moving) return;
 
-    const now = Date.now();
-    const val = String(raw || "").trim();
-    if (!val) return;
+  const now = Date.now();
+  const val = String(raw || "").trim();
+  if (!val) return;
 
-    if (val === lastScan.value && now - lastScan.at < 1200) return;
-    setLastScan({ value: val, at: now });
+  // debounce gleiche Werte
+  if (val === lastScan.value && now - lastScan.at < 1200) return;
+  setLastScan({ value: val, at: now });
 
-    const parsed = parsePlace(val);
-    if (!parsed) {
-      alert("❗ QR ungültig. Erwartet z.B. C1 oder C1-L5");
-      return;
-    }
+  const parsed = parsePlace(val);
+  if (!parsed) {
+    alert("❗ QR ungültig. Erwartet z.B. C1 oder C1-L5");
+    return;
+  }
 
-    if (qrMode === "source") {
-      const lvl = parsed.level ?? findTopOccupiedLevel(slotMap, parsed.shelf, levels);
-      if (!lvl) {
-        alert(`ℹ️ ${parsed.shelf} hat keinen Bestand.`);
-        return;
-      }
-      setQrSource({ shelf: parsed.shelf, level: lvl });
-      setQrMode("target");
-      return;
-    }
+  const mode = qrModeRef.current; // ✅ SOFORTIGER Modus
 
-    const lvl = parsed.level ?? findBottomEmptyLevel(slotMap, parsed.shelf, levels);
+  // ===== SOURCE =====
+  if (mode === "source") {
+    const lvl = parsed.level ?? findTopOccupiedLevel(slotMap, parsed.shelf, levels);
     if (!lvl) {
-      alert(`❗ ${parsed.shelf} ist voll.`);
+      alert(`ℹ️ ${parsed.shelf} hat keinen Bestand.`);
       return;
     }
 
-    setQrTarget({ shelf: parsed.shelf, level: lvl });
-    setScanLocked(true);
-    setConfirmOpen(true);
+    // Quelle setzen
+    setQrSource({ shelf: parsed.shelf, level: lvl });
 
-    // optional: haptics
-    try {
-      if (navigator.vibrate) navigator.vibrate(30);
-    } catch {}
-  };
+    // ✅ SOFORT auf target schalten (Ref + State)
+    qrModeRef.current = "target";
+    setQrMode("target");
+
+    // ✅ kurze Sperre gegen Doppel-Scan direkt danach (sehr wichtig!)
+    scanLockRef.current = true;
+    setScanLocked(true);
+    setTimeout(() => {
+      scanLockRef.current = false;
+      setScanLocked(false);
+    }, 500);
+
+    return;
+  }
+
+  // ===== TARGET =====
+  const lvl = parsed.level ?? findBottomEmptyLevel(slotMap, parsed.shelf, levels);
+  if (!lvl) {
+    alert(`❗ ${parsed.shelf} ist voll.`);
+    return;
+  }
+
+  setQrTarget({ shelf: parsed.shelf, level: lvl });
+
+  // ✅ nach Zielscan: sofort sperren & Confirm öffnen
+  scanLockRef.current = true;
+  setScanLocked(true);
+  setConfirmOpen(true);
+
+  try {
+    if (navigator.vibrate) navigator.vibrate(30);
+  } catch {}
+};
 
   const handleMoveConfirm = async () => {
     if (!qrSource.shelf || !qrTarget.shelf) return;
