@@ -540,58 +540,87 @@ export default function App() {
      QR APPLY SCAN (FIXED)
 ========================= */
   const applyScan = (raw) => {
-    if (moving || confirmOpen) return;
+  if (moving || confirmOpen) return;
 
-    const now = Date.now();
-    if (now < ignoreUntilRef.current) return;
+  const now = Date.now();
 
-    const val = String(raw || "").trim();
-    if (!val) return;
+  // Global ignore window (already used)
+  if (now < ignoreUntilRef.current) return;
 
-    if (val === lastScan.value && now - lastScan.at < 900) return;
-    setLastScan({ value: val, at: now });
+  const val = String(raw || "").trim();
+  if (!val) return;
 
-    const parsed = parsePlace(val);
-    if (!parsed) {
-      alert("❗ QR ungültig. Erwartet z.B. C8 oder C8-L3");
-      return;
-    }
+  // Anti-spam: same text too fast
+  if (val === lastScan.value && now - lastScan.at < 900) return;
+  setLastScan({ value: val, at: now });
 
-    const step = stepRef.current;
+  const parsed = parsePlace(val);
+  if (!parsed) {
+    alert("❗ QR ungültig. Erwartet z.B. C8 oder C8-L3");
+    return;
+  }
 
-    if (step === "source") {
-      const lvl = parsed.level ?? findTopOccupiedLevel(slotMap, parsed.shelf, levels);
-      if (!lvl) {
-        alert(`ℹ️ ${parsed.shelf} hat keinen Bestand.`);
-        return;
-      }
+  const step = stepRef.current;
 
-      setQrSource({ shelf: parsed.shelf, level: lvl });
+  // ===== SETTINGS =====
+  const cooldownAfterSourceMs = 1200; // <- wichtig gegen doppelscan
+  const sourceSetAtRef = applyScan.sourceSetAtRef || (applyScan.sourceSetAtRef = { t: 0 });
+  const sourceShelfRef = applyScan.sourceShelfRef || (applyScan.sourceShelfRef = { shelf: null });
 
-      // SOFORT auf target (ref, kein state lag)
-      stepRef.current = "target";
-
-      // kurze Pause gegen doppel-scan
-      ignoreUntilRef.current = Date.now() + 650;
-
-      try { navigator.vibrate?.(30); } catch {}
-      return;
-    }
-
-    // TARGET
-    const lvl = parsed.level ?? findBottomEmptyLevel(slotMap, parsed.shelf, levels);
+  if (step === "source") {
+    const lvl = parsed.level ?? findTopOccupiedLevel(slotMap, parsed.shelf, levels);
     if (!lvl) {
-      alert(`❗ ${parsed.shelf} ist voll.`);
+      alert(`ℹ️ ${parsed.shelf} hat keinen Bestand.`);
       return;
     }
 
-    setQrTarget({ shelf: parsed.shelf, level: lvl });
+    // set source
+    setQrSource({ shelf: parsed.shelf, level: lvl });
 
-    // sofort confirm öffnen -> scanner pausiert automatisch
-    setConfirmOpen(true);
+    // switch immediately to target
+    stepRef.current = "target";
 
-    try { navigator.vibrate?.([30, 30, 30]); } catch {}
-  };
+    // remember source shelf + time
+    sourceShelfRef.shelf = parsed.shelf;
+    sourceSetAtRef.t = Date.now();
+
+    // HARD freeze for short time -> ignores the "next frames"
+    ignoreUntilRef.current = Date.now() + cooldownAfterSourceMs;
+
+    try { navigator.vibrate?.(30); } catch {}
+    return;
+  }
+
+  // ===== TARGET =====
+
+  // 1) Too fast after source? ignore (extra safety besides ignoreUntilRef)
+  if (now - sourceSetAtRef.t < cooldownAfterSourceMs) {
+    return; // still cooling down
+  }
+
+  // 2) Optional but recommended: target must be DIFFERENT shelf than source
+  if (sourceShelfRef.shelf && parsed.shelf === sourceShelfRef.shelf) {
+    // ignore and tell user what to do
+    alert(`ℹ️ Ziel muss ein anderes Regal sein als die Quelle (${sourceShelfRef.shelf}).`);
+    // small ignore to avoid repeated alerts from same QR
+    ignoreUntilRef.current = Date.now() + 800;
+    return;
+  }
+
+  const lvl = parsed.level ?? findBottomEmptyLevel(slotMap, parsed.shelf, levels);
+  if (!lvl) {
+    alert(`❗ ${parsed.shelf} ist voll.`);
+    ignoreUntilRef.current = Date.now() + 800;
+    return;
+  }
+
+  setQrTarget({ shelf: parsed.shelf, level: lvl });
+
+  // open confirm -> scanner pauses
+  setConfirmOpen(true);
+
+  try { navigator.vibrate?.([30, 30, 30]); } catch {}
+};
 
   const doMove = async () => {
     if (!qrSource.shelf || !qrTarget.shelf) return;
