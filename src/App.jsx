@@ -591,68 +591,43 @@ export default function App() {
   };
 
 const applyScan = (raw) => {
-  // harte Sperre: wenn Confirm offen / moving / lock
-  if (scanLockRef.current || confirmOpen || moving) return;
+  if (confirmOpen || moving) return;
 
   const now = Date.now();
+  if (now < ignoreUntilRef.current) return;
+
   const val = String(raw || "").trim();
   if (!val) return;
 
-  // debounce gleiche Werte
   if (val === lastScan.value && now - lastScan.at < 1200) return;
   setLastScan({ value: val, at: now });
 
   const parsed = parsePlace(val);
-  if (!parsed) {
-    alert("❗ QR ungültig. Erwartet z.B. C1 oder C1-L5");
-    return;
-  }
+  if (!parsed) return alert("❗ QR ungültig...");
 
-  const mode = qrModeRef.current; // ✅ SOFORTIGER Modus
+  const mode = qrModeRef.current;
 
-  // ===== SOURCE =====
   if (mode === "source") {
     const lvl = parsed.level ?? findTopOccupiedLevel(slotMap, parsed.shelf, levels);
-    if (!lvl) {
-      alert(`ℹ️ ${parsed.shelf} hat keinen Bestand.`);
-      return;
-    }
+    if (!lvl) return alert(`ℹ️ ${parsed.shelf} hat keinen Bestand.`);
 
-    // Quelle setzen
     setQrSource({ shelf: parsed.shelf, level: lvl });
 
-    // ✅ SOFORT auf target schalten (Ref + State)
     qrModeRef.current = "target";
     setQrMode("target");
 
-    // ✅ kurze Sperre gegen Doppel-Scan direkt danach (sehr wichtig!)
-    scanLockRef.current = true;
-    setScanLocked(true);
-    setTimeout(() => {
-      scanLockRef.current = false;
-      setScanLocked(false);
-    }, 500);
-
+    // ✅ kurze Pause, aber Scanner läuft weiter
+    ignoreUntilRef.current = Date.now() + 600;
     return;
   }
 
-  // ===== TARGET =====
   const lvl = parsed.level ?? findBottomEmptyLevel(slotMap, parsed.shelf, levels);
-  if (!lvl) {
-    alert(`❗ ${parsed.shelf} ist voll.`);
-    return;
-  }
+  if (!lvl) return alert(`❗ ${parsed.shelf} ist voll.`);
 
   setQrTarget({ shelf: parsed.shelf, level: lvl });
 
-  // ✅ nach Zielscan: sofort sperren & Confirm öffnen
-  scanLockRef.current = true;
-  setScanLocked(true);
+  // ✅ JETZT wirklich sperren + confirm öffnen (Scanner wird dadurch pausiert)
   setConfirmOpen(true);
-
-  try {
-    if (navigator.vibrate) navigator.vibrate(30);
-  } catch {}
 };
 
   const handleMoveConfirm = async () => {
@@ -700,7 +675,7 @@ const applyScan = (raw) => {
       </div>
     );
 
-  const scannerEnabled = activeTab === "move" && !confirmOpen && !scanLocked && !moving;
+const scannerEnabled = activeTab === "move" && !confirmOpen && !moving;
 
   return (
     <div className="max-w-4xl mx-auto min-h-screen pb-36 relative">
