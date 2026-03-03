@@ -890,7 +890,7 @@ export default function App() {
                 />
               </div>
 
-              <QRScanner onResult={applyScan} onError={() => {}} />
+              <QRScanner enabled={true} onResult={applyScan} onError={(e) => console.error(e)} />
 
               <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-2">
                 <div className="text-[10px] font-black uppercase text-slate-400">Fallback</div>
