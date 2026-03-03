@@ -931,111 +931,142 @@ export default function App() {
           </div>
         )}
 
-        {/* MOVE (QR SLOT ONLY) */}
-        {activeTab === "move" && (
-          <div className="space-y-4">
-            <div className="bg-white p-7 rounded-[2.5rem] shadow-xl border border-slate-200 space-y-5">
-              <div className="flex items-center gap-3">
-                <div className="p-2 bg-blue-100 text-blue-600 rounded-xl">
-                  <Icon name="qr-code" />
-                </div>
-                <div className="min-w-0">
-                  <h3 className="font-black uppercase text-slate-800 italic text-xl leading-tight">
-                    Umlagern (QR)
-                  </h3>
-                  <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
-                    Quelle scannen → Ziel scannen → Bestätigen
-                  </p>
-                </div>
+{/* MOVE (QR SLOT ONLY) */}
+{activeTab === "move" && (
+  <div className="space-y-4">
+    <div className="bg-white p-7 rounded-[2.5rem] shadow-xl border border-slate-200 space-y-5">
+      {/* Header */}
+      <div className="flex items-center gap-3">
+        <div className="p-2 bg-blue-100 text-blue-600 rounded-xl">
+          <Icon name="qr-code" />
+        </div>
+        <div className="min-w-0">
+          <h3 className="font-black uppercase text-slate-800 italic text-xl leading-tight">
+            Umlagern (QR)
+          </h3>
+          <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+            Quelle scannen → Ziel scannen → Bestätigen
+          </p>
+        </div>
+      </div>
+
+      {/* Compact status chips */}
+      <div className="flex gap-2 flex-wrap">
+        <StatChip
+          label="Modus"
+          value={stepRef.current === "source" ? "Quelle scannen" : "Ziel scannen"}
+          tone="blue"
+        />
+        <StatChip
+          label="Quelle"
+          value={qrSource.shelf ? `${qrSource.shelf}-L${qrSource.level}` : "—"}
+          tone={qrSource.shelf ? "emerald" : "slate"}
+        />
+        <StatChip
+          label="Ziel"
+          value={qrTarget.shelf ? `${qrTarget.shelf}-L${qrTarget.level}` : "—"}
+          tone={qrTarget.shelf ? "emerald" : "slate"}
+        />
+      </div>
+
+      {/* ✅ Confirmation above camera (only source/target + 1 button) */}
+      {confirmOpen && qrSource.shelf && qrTarget.shelf ? (
+        <div className="bg-blue-50 border border-blue-200 rounded-[1.5rem] p-4">
+          <div className="text-[10px] font-black uppercase text-blue-700 tracking-widest mb-2">
+            Umlagerung bestätigen
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div className="bg-white border border-slate-200 rounded-2xl p-3">
+              <div className="text-[10px] font-black uppercase text-slate-400">Quelle</div>
+              <div className="font-black text-slate-900 text-lg">
+                {qrSource.shelf}-L{qrSource.level}
               </div>
+            </div>
 
-              <div className="flex gap-2 flex-wrap">
-                <StatChip label="Modus" value={stepRef.current === "source" ? "Quelle scannen" : "Ziel scannen"} tone="blue" />
-                <StatChip label="Quelle" value={qrSource.shelf ? `${qrSource.shelf}-L${qrSource.level}` : "—"} tone={qrSource.shelf ? "emerald" : "slate"} />
-                <StatChip label="Ziel" value={qrTarget.shelf ? `${qrTarget.shelf}-L${qrTarget.level}` : "—"} tone={qrTarget.shelf ? "emerald" : "slate"} />
+            <div className="bg-white border border-slate-200 rounded-2xl p-3">
+              <div className="text-[10px] font-black uppercase text-slate-400">Ziel</div>
+              <div className="font-black text-slate-900 text-lg">
+                {qrTarget.shelf}-L{qrTarget.level}
               </div>
-
-              <QRScanner enabled={scannerEnabled} onResult={applyScan} onError={() => {}} />
-
-              {/* Fallback */}
-              <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-3">
-                <div className="text-[10px] font-black uppercase text-slate-400">Fallback</div>
-
-                <input
-                  value={qrTextFallback}
-                  onChange={(e) => setQrTextFallback(e.target.value)}
-                  placeholder="z.B. C8 oder C8-L2"
-                  className="w-full p-3 bg-white rounded-xl font-bold border-2 border-slate-100 outline-none"
-                />
-
-                <div className="flex justify-center">
-                  <button
-                    type="button"
-                    onClick={() => applyScan(qrTextFallback)}
-                    disabled={moving || confirmOpen}
-                    className={`px-8 py-3 rounded-xl font-black active:scale-95 transition-all ${
-                      moving || confirmOpen ? "bg-slate-300 text-white cursor-not-allowed" : "bg-slate-900 text-yellow-500"
-                    }`}
-                  >
-                    Anwenden
-                  </button>
-                </div>
-
-                <div className="text-[10px] text-slate-500 font-bold text-center">
-                  Quelle: oberste belegte Ebene • Ziel: unterste freie Ebene
-                </div>
-              </div>
-
-              {/* Confirm */}
-              {confirmOpen && qrSource.shelf && qrTarget.shelf && (
-                <div className="bg-white border-2 border-blue-200 rounded-[1.5rem] p-4">
-                  <div className="font-black text-slate-900 mb-2">Umlagerung bestätigen?</div>
-                  <div className="text-[12px] font-bold text-slate-600">
-                    Quelle: <span className="text-slate-900">{qrSource.shelf}-L{qrSource.level}</span><br />
-                    Ziel: <span className="text-slate-900">{qrTarget.shelf}-L{qrTarget.level}</span>
-                  </div>
-
-                  <div className="mt-4 flex gap-2">
-                    <button
-                      type="button"
-                      onClick={() => setConfirmOpen(false)}
-                      disabled={moving}
-                      className="flex-1 py-3 bg-slate-100 rounded-xl font-black text-[11px] text-slate-700"
-                    >
-                      Abbrechen
-                    </button>
-                    <button
-                      type="button"
-                      onClick={async () => {
-                        setConfirmOpen(false);
-                        await doMove();
-                      }}
-                      disabled={moving}
-                      className={`flex-1 py-3 rounded-xl font-black text-[11px] text-white ${
-                        moving ? "bg-slate-400" : "bg-blue-700"
-                      }`}
-                    >
-                      {moving ? "Umlagern..." : "Bestätigen"}
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              <div className="flex gap-2">
-                <button type="button" onClick={resetSource} className="flex-1 py-3 bg-slate-100 rounded-xl font-black text-[11px] text-slate-700">
-                  Quelle zurücksetzen
-                </button>
-                <button type="button" onClick={resetTarget} className="flex-1 py-3 bg-slate-100 rounded-xl font-black text-[11px] text-slate-700">
-                  Ziel zurücksetzen
-                </button>
-              </div>
-
-              <button type="button" onClick={resetAll} className="w-full py-3 bg-slate-900 text-yellow-500 rounded-xl font-black text-[11px]">
-                Alles zurücksetzen
-              </button>
             </div>
           </div>
-        )}
+
+          <button
+            type="button"
+            onClick={async () => {
+              // confirm overlay closes, move executes
+              setConfirmOpen(false);
+              await doMove();
+            }}
+            disabled={moving}
+            className={`w-full mt-4 py-4 text-white rounded-[1.2rem] font-black uppercase shadow-lg active:scale-95 transition-all ${
+              moving ? "bg-slate-400 shadow-none cursor-not-allowed" : "bg-blue-700 shadow-blue-700/20"
+            }`}
+          >
+            {moving ? "Umlagern..." : "Bestätigen"}
+          </button>
+
+          <div className="mt-2 text-[10px] text-blue-700/80 font-bold text-center">
+            Scanner ist pausiert bis zur Bestätigung.
+          </div>
+        </div>
+      ) : null}
+
+      {/* Camera */}
+      <QRScanner enabled={scannerEnabled} onResult={applyScan} onError={() => {}} />
+
+      {/* Reset buttons (still useful) */}
+      <div className="flex gap-2">
+        <button
+          type="button"
+          onClick={resetSource}
+          className="flex-1 py-3 bg-slate-100 rounded-xl font-black text-[11px] text-slate-700"
+        >
+          Quelle zurücksetzen
+        </button>
+        <button
+          type="button"
+          onClick={resetTarget}
+          className="flex-1 py-3 bg-slate-100 rounded-xl font-black text-[11px] text-slate-700"
+        >
+          Ziel zurücksetzen
+        </button>
+      </div>
+
+      {/* ✅ Fallback ganz nach unten */}
+      <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-3">
+        <div className="text-[10px] font-black uppercase text-slate-400">Fallback</div>
+
+        <input
+          value={qrTextFallback}
+          onChange={(e) => setQrTextFallback(e.target.value)}
+          placeholder="z.B. C8 oder C8-L3"
+          className="w-full p-3 bg-white rounded-xl font-bold border-2 border-slate-100 outline-none"
+        />
+
+        <div className="flex justify-center">
+          <button
+            type="button"
+            onClick={() => applyScan(qrTextFallback)}
+            disabled={moving || confirmOpen}
+            className={`px-10 py-3 rounded-xl font-black active:scale-95 transition-all ${
+              moving || confirmOpen
+                ? "bg-slate-300 text-white cursor-not-allowed"
+                : "bg-slate-900 text-yellow-500"
+            }`}
+          >
+            Anwenden
+          </button>
+        </div>
+
+        <div className="text-[10px] text-slate-500 font-bold text-center">
+          Quelle: oberste belegte Ebene • Ziel: unterste freie Ebene
+        </div>
+      </div>
+    </div>
+  </div>
+)}
 
         {/* OUTBOUND */}
         {activeTab === "outbound" && (
