@@ -48,62 +48,104 @@ function findBottomEmptyLevel(slotMap, shelf, levels) {
   return null;
 }
 
-function QRScanner({ onResult, onError }) {
-  const videoRef = useRef(null);
+function QRScanner({ enabled, onResult, onError }) {
   const [running, setRunning] = useState(false);
+  const [ready, setReady] = useState(false);
+  const regionId = "qr-reader-region";
+
+  const qrRef = useRef(null);
 
   useEffect(() => {
-    let stream;
-    let raf;
-    let detector;
+    // Element sicher "ready" setzen
+    const t = setTimeout(() => setReady(true), 50);
+    return () => clearTimeout(t);
+  }, []);
 
-    async function start() {
-      try {
-        if (!("BarcodeDetector" in window)) {
-          onError?.(new Error("BarcodeDetector nicht verfügbar."));
-          return;
-        }
+  const start = async () => {
+    try {
+      if (!enabled) return;
+      if (!ready) return;
 
-        detector = new window.BarcodeDetector({ formats: ["qr_code"] });
+      // wenn schon läuft -> nix tun
+      if (running) return;
 
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: "environment" },
-          audio: false,
-        });
+      // Instanz erstellen (oder wiederverwenden)
+      if (!qrRef.current) qrRef.current = new Html5Qrcode(regionId);
 
-        if (!videoRef.current) return;
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play();
-        setRunning(true);
+      setRunning(true);
 
-        const scan = async () => {
-          try {
-            const codes = await detector.detect(videoRef.current);
-            if (codes?.length) onResult(codes[0].rawValue);
-          } catch {}
-          raf = requestAnimationFrame(scan);
-        };
-
-        raf = requestAnimationFrame(scan);
-      } catch (e) {
-        onError?.(e);
-      }
-    }
-
-    start();
-
-    return () => {
-      if (raf) cancelAnimationFrame(raf);
-      if (stream) stream.getTracks().forEach((t) => t.stop());
+      await qrRef.current.start(
+        { facingMode: "environment" },
+        { fps: 10, qrbox: { width: 240, height: 240 } },
+        (decodedText) => onResult(decodedText),
+        () => {}
+      );
+    } catch (e) {
+      console.error("QR start error:", e);
       setRunning(false);
+      onError?.(e);
+    }
+  };
+
+  const stop = async () => {
+    try {
+      if (!qrRef.current) return;
+      await qrRef.current.stop().catch(() => {});
+      await qrRef.current.clear().catch(() => {});
+    } catch (e) {
+      // ignore
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  // Wenn enabled false wird (z.B. confirmOpen), Scanner stoppen
+  useEffect(() => {
+    if (!enabled && running) stop();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [enabled]);
+
+  // Cleanup
+  useEffect(() => {
+    return () => {
+      stop();
+      qrRef.current = null;
     };
-  }, [onResult, onError]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <div className="bg-slate-900 rounded-2xl overflow-hidden border border-slate-700">
-      <video ref={videoRef} className="w-full h-56 object-cover" playsInline muted />
-      <div className="p-3 text-[11px] font-bold text-slate-300">
-        {running ? "Scanner aktiv (QR ins Bild halten)" : "Scanner wird gestartet... (Fallback möglich)"}
+      <div id={regionId} className="w-full" />
+
+      <div className="p-3 flex items-center justify-between gap-2">
+        <div className="text-[11px] font-bold text-slate-300">
+          {enabled ? (running ? "Scanner aktiv" : "Scanner bereit") : "Scanner pausiert"}
+        </div>
+
+        {enabled && !running ? (
+          <button
+            type="button"
+            onClick={start}
+            className="px-4 py-2 bg-yellow-500 text-slate-900 rounded-xl font-black text-[11px] active:scale-95"
+          >
+            Scanner starten
+          </button>
+        ) : null}
+
+        {enabled && running ? (
+          <button
+            type="button"
+            onClick={stop}
+            className="px-4 py-2 bg-slate-700 text-white rounded-xl font-black text-[11px] active:scale-95"
+          >
+            Stop
+          </button>
+        ) : null}
+      </div>
+
+      <div className="px-3 pb-3 text-[10px] font-bold text-slate-400">
+        iPhone: Kamera startet zuverlässig nach Klick auf „Scanner starten“.
       </div>
     </div>
   );
