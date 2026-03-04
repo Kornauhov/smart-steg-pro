@@ -1,15 +1,45 @@
-export const safeDocId = (s) => String(s || "").replace(/\//g, "_").trim();
-export const slotIdFrom = (shelf, level) => `${String(shelf)}_L${Number(level)}`;
+// src/utils/ids.js
 
-// derive slotId/shelf/level from path: artifacts/{appId}/public/data/slots/{slotId}/items/{itemId}
-export const deriveFromPath = (path) => {
-  const parts = String(path).split("/");
-  const idx = parts.indexOf("slots");
-  if (idx === -1) return { slotId: null, shelf: null, level: null };
-  const slotId = parts[idx + 1] || null;
-  if (!slotId) return { slotId: null, shelf: null, level: null };
+// SlotId Standard bei dir: "C10_L1"
+export function slotIdFrom(shelf, level) {
+  return `${String(shelf || "").toUpperCase()}_L${Number(level)}`;
+}
 
-  const m = String(slotId).match(/^(.+)_L(\d+)$/);
-  if (!m) return { slotId, shelf: null, level: null };
-  return { slotId: m[0], shelf: m[1], level: Number(m[2]) };
-};
+// Firestore doc ids dürfen kein "/" enthalten.
+export function safeDocId(input) {
+  return String(input ?? "")
+    .trim()
+    .replace(/\//g, "_")
+    .replace(/#/g, "_")
+    .replace(/\s+/g, "_")
+    .slice(0, 150);
+}
+
+// Pfad -> Infos ableiten
+export function deriveFromPath(path = "") {
+  const p = String(path || "");
+
+  // artifacts/{APP_ID}/public/data/slots/{slotId}/items/{itemId}
+  const m = p.match(
+    /artifacts\/([^/]+)\/public\/data\/slots\/([^/]+)\/items\/([^/]+)/
+  );
+  if (m) {
+    const appId = m[1];
+    const slotIdRaw = m[2];
+
+    // SlotId kann sein: "C1_L4", "C1_l4", "C1-L4", "C1L4", "C1|4"
+    const mm = String(slotIdRaw)
+      .toUpperCase()
+      .match(/^C(\d{1,2})(?:[|_\- ]?L?(\d))?$/);
+
+    const shelf = mm ? `C${Number(mm[1])}` : null;
+    const level = mm && mm[2] ? Number(mm[2]) : null;
+
+    // slotId immer normalisieren auf "Cxx_Ly"
+    const slotId = shelf && level ? slotIdFrom(shelf, level) : String(slotIdRaw);
+
+    return { appId, slotId, shelf, level };
+  }
+
+  return { appId: null, slotId: null, shelf: null, level: null };
+}

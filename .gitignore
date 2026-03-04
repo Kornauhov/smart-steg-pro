@@ -4,6 +4,11 @@ dist
 
 # Environment
 .env
+.env.local
+.env.*.local
+
+# Firebase Admin (sehr wichtig)
+admin/serviceAccountKey.json
 
 # Mac
 .DS_Store
@@ -12,3 +17,6 @@ dist
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# Optional (Vite)
+.vercel

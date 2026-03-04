@@ -1,8 +1,17 @@
 import { initializeApp } from "firebase/app";
-import { getFirestore } from "firebase/firestore";
 import { getAuth } from "firebase/auth";
-import { firebaseConfig } from "../config/firebaseConfig.js";
+import { getFirestore } from "firebase/firestore";
 
-export const app = initializeApp(firebaseConfig);
-export const db = getFirestore(app);
+const firebaseConfig = {
+  apiKey: "AIzaSyBGqPXXcmJTbL3PVrn-PKL0Gig45r6GPbQ",
+  authDomain: "steg-lager-test.firebaseapp.com",
+  projectId: "steg-lager-test",
+  storageBucket: "steg-lager-test.appspot.com",
+  messagingSenderId: "655203951825",
+  appId: "1:655203951825:web:9edcfb40f29ed70f61d1f0"
+};
+
+const app = initializeApp(firebaseConfig);
+
 export const auth = getAuth(app);
+export const db = getFirestore(app);

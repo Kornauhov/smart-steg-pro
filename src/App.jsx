@@ -13,6 +13,7 @@ import {
   onSnapshot,
   query,
   updateDoc,
+  where,
 } from "firebase/firestore";
 import {
   onAuthStateChanged,
@@ -38,7 +39,8 @@ import NavBtn from "./components/NavBtn.jsx";
 ========================= */
 function parsePlace(text) {
   const raw = String(text || "").trim().toUpperCase();
-  const m = raw.match(/^C(\d{1,2})(?:\s*[-_ ]?\s*L(\d))?$/);
+  // akzeptiert: C1, C1-L3, C1_L3, C1 L3, C1l3, C1-L3
+  const m = raw.match(/^C(\d{1,2})(?:\s*[-_ ]?\s*L(\d))?$/i);
   if (!m) return null;
   return { shelf: `C${Number(m[1])}`, level: m[2] ? Number(m[2]) : null };
 }
@@ -233,7 +235,7 @@ const QRScanner = forwardRef(function QRScanner(
     running,
   ]);
 
-  // ✅ AutoStart wenn enabled
+  // AutoStart wenn enabled
   useEffect(() => {
     if (!enabled) {
       if (running) stop();
@@ -342,7 +344,7 @@ export default function App() {
   const goTab = (t) => {
     const protectedTabs = new Set(["add", "move", "outbound"]);
     if (protectedTabs.has(t) && !canWriteStock) {
-      setActiveTab("dashboard"); // bleibt sichtbar, aber führt zurück
+      setActiveTab("dashboard");
       return;
     }
     setActiveTab(t);
@@ -426,14 +428,12 @@ export default function App() {
 
     setInPlace(p);
 
-    // ✅ sofort barcode mode
+    // sofort barcode mode
     setInStep("barcode");
     inStepRef.current = "barcode";
 
-    // ✅ ignore next frames
     inboundIgnoreUntilRef.current = Date.now() + 900;
 
-    // ✅ stop and restart scanner -> clean switch
     await inboundScannerRef.current?.stop?.();
     setTimeout(() => inboundScannerRef.current?.start?.(), 250);
 
@@ -461,7 +461,6 @@ export default function App() {
       extra: p.extra,
     }));
 
-    // ✅ stop after barcode scan to prevent double scans
     await inboundScannerRef.current?.stop?.();
     inboundIgnoreUntilRef.current = Date.now() + 600;
 
@@ -487,7 +486,7 @@ export default function App() {
     !reqMissing.lengthMm;
 
   /* =========================
-     Auth init (Email/Passwort + Guest)
+     Auth init
 ========================= */
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, async (u) => {
@@ -505,13 +504,16 @@ export default function App() {
 
   /* =========================
      Firestore subscriptions
-     - Für Gäste: READ ist erlaubt (Rules)
-     - Für eingeloggte: auch read
+     - Wichtig: items collectionGroup ist gefiltert auf appId
 ========================= */
   useEffect(() => {
-    // Wir laden Daten auch ohne Login (guest view).
-    // Falls du lesen NUR mit Auth willst -> Rules ändern und hier: if (!user) return;
-    const itemsQ = query(collectionGroup(db, "items"));
+    if (DEBUG) console.log("🔥 Subscriptions start...");
+
+    const itemsQ = query(
+      collectionGroup(db, "items"),
+      where("appId", "==", APP_ID)
+    );
+
     const unsubItems = onSnapshot(
       itemsQ,
       (snap) => {
@@ -520,10 +522,10 @@ export default function App() {
           __id: d.id,
           ...d.data(),
         }));
-        if (DEBUG) console.log("RAW items snap:", snap.size, docs.slice(0, 3));
+        if (DEBUG) console.log("📦 items size:", snap.size, docs[0]?.__path);
         setRawItems(docs);
       },
-      (err) => console.error("Items fetch error:", err)
+      (err) => console.error("❌ Items fetch error:", err)
     );
 
     const unsubSteg = onSnapshot(
@@ -551,6 +553,7 @@ export default function App() {
       unsubSteg();
       unsubMaster();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   /* =========================
@@ -687,7 +690,8 @@ export default function App() {
 ========================= */
   const doInboundPutaway = async () => {
     try {
-      if (!canWriteStock) return alert("❗ Bitte als Mitarbeiter anmelden (Versorger/Planung/Admin).");
+      if (!canWriteStock)
+        return alert("❗ Bitte als Mitarbeiter anmelden (Versorger/Planung/Admin).");
       if (!inPlace?.shelf) return alert("Bitte zuerst Platz scannen.");
 
       const itemKey = String(inbound.itemKey || "").trim();
@@ -771,7 +775,8 @@ export default function App() {
 
   const handleRemoveStock = async (e) => {
     e.preventDefault();
-    if (!canWriteStock) return alert("❗ Bitte als Mitarbeiter anmelden (Versorger/Planung/Admin).");
+    if (!canWriteStock)
+      return alert("❗ Bitte als Mitarbeiter anmelden (Versorger/Planung/Admin).");
 
     const qty = Number(outStock.qty);
     if (!outStock.entryId || !qty || qty <= 0) return;
@@ -906,7 +911,8 @@ export default function App() {
   };
 
   const doMove = async () => {
-    if (!canWriteStock) return alert("❗ Bitte als Mitarbeiter anmelden (Versorger/Planung/Admin).");
+    if (!canWriteStock)
+      return alert("❗ Bitte als Mitarbeiter anmelden (Versorger/Planung/Admin).");
     if (!qrSource.shelf || !qrTarget.shelf) return;
 
     setMoving(true);
@@ -1200,7 +1206,7 @@ export default function App() {
                   onResult={(txt) => {
                     if (Date.now() < inboundIgnoreUntilRef.current) return;
 
-                    // ✅ WICHTIG: wenn Platz schon gescannt ist -> IMMER Barcode
+                    // wenn Platz schon gescannt ist -> IMMER Barcode
                     if (inPlace?.shelf) {
                       onScanBarcodeForInbound(txt);
                       return;
